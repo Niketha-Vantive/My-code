@@ -4,6 +4,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from openai import AzureOpenAI
 from docx import Document
+from docx2pdf import convert
 from dotenv import load_dotenv
 import os
 import re
@@ -21,20 +22,18 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///sessions.db"
 db = SQLAlchemy(app)
 
-# Azure OpenAI Client
 client = AzureOpenAI(
     api_key=os.getenv("AZURE_API_KEY"),
     api_version=os.getenv("AZURE_API_VERSION"),
     azure_endpoint=os.getenv("AZURE_API_ENDPOINT")
 )
 
-model_deployed = "gpt-4o"  # or your current deployed model
+model_deployed = "gpt-4o"
 
 
-# --- UTILS ---
+# === UTILITIES ===
 
 def find_placeholders(doc_path):
-    """Find all {placeholder} or {{placeholder}} in paragraphs and tables."""
     doc = Document(doc_path)
     placeholders = set()
 
@@ -52,16 +51,13 @@ def find_placeholders(doc_path):
 
 
 def replace_placeholders_in_docx(input_path, output_path, replacements):
-    """Replace placeholders inside paragraphs and table cells."""
     doc = Document(input_path)
 
-    # Replace in paragraphs
     for para in doc.paragraphs:
         for key, val in replacements.items():
             pattern = re.compile(r"\{+ *" + re.escape(key) + r" *\}+")
             para.text = pattern.sub(val, para.text)
 
-    # Replace in tables
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -72,7 +68,7 @@ def replace_placeholders_in_docx(input_path, output_path, replacements):
     doc.save(output_path)
 
 
-# --- ROUTES ---
+# === ROUTES ===
 
 @app.route('/')
 def landing():
@@ -116,19 +112,30 @@ def chat():
         session['filled_placeholders'] = filled
         session['awaiting_placeholder'] = None
 
+    input_path = session['uploaded_file']
+    output_path = os.path.join(app.config["UPLOAD_FOLDER"], 'output_filled.docx')
+
+    replace_placeholders_in_docx(input_path, output_path, filled)
+
+    try:
+        convert(output_path)  # output PDF in same folder
+    except Exception as e:
+        print("PDF conversion failed:", e)
+
     if set(filled.keys()) == set(expected):
-        input_path = session['uploaded_file']
-        output_path = os.path.join(app.config["UPLOAD_FOLDER"], 'output_filled.docx')
-        replace_placeholders_in_docx(input_path, output_path, filled)
-        return jsonify({"response": "✅ All placeholders filled! The document has been updated."})
+        return jsonify({
+            "response": "✅ All placeholders filled! The document has been updated."
+        })
 
     remaining = list(set(expected) - set(filled.keys()))
     if remaining:
         next_placeholder = remaining[0]
         session['awaiting_placeholder'] = next_placeholder
-        return jsonify({"response": f"❓ What is the value for '{{{{{next_placeholder}}}}}'?"})
-    else:
-        return jsonify({"response": "No placeholders found or already filled."})
+        return jsonify({
+            "response": f"❓ What is the value for '{{{{{next_placeholder}}}}}'?"
+        })
+
+    return jsonify({"response": "No more placeholders left."})
 
 
 @app.route('/uploads/<path:filename>')
@@ -146,3 +153,5 @@ def download_filled():
 
 if __name__ == '__main__':
     app.run(debug=True, port=5050)
+
+
