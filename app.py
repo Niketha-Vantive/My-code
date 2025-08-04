@@ -53,19 +53,31 @@ def find_placeholders(doc_path):
 def replace_placeholders_in_docx(input_path, output_path, replacements):
     doc = Document(input_path)
 
+    def replace_in_runs(runs, key, val):
+        combined = ''.join(run.text for run in runs)
+        pattern = re.compile(r"\{+ *" + re.escape(key) + r" *\}+")
+        if pattern.search(combined):
+            replaced = pattern.sub(val, combined)
+            # Clear all runs and set new value in first run
+            for run in runs:
+                run.text = ''
+            runs[0].text = replaced
+
+    # Replace in paragraphs
     for para in doc.paragraphs:
         for key, val in replacements.items():
-            pattern = re.compile(r"\{+ *" + re.escape(key) + r" *\}+")
-            para.text = pattern.sub(val, para.text)
+            replace_in_runs(para.runs, key, val)
 
+    # Replace in tables
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                for key, val in replacements.items():
-                    pattern = re.compile(r"\{+ *" + re.escape(key) + r" *\}+")
-                    cell.text = pattern.sub(val, cell.text)
+                for para in cell.paragraphs:
+                    for key, val in replacements.items():
+                        replace_in_runs(para.runs, key, val)
 
     doc.save(output_path)
+
 
 
 # === ROUTES ===
@@ -153,5 +165,6 @@ def download_filled():
 
 if __name__ == '__main__':
     app.run(debug=True, port=5050)
+
 
 
