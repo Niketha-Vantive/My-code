@@ -4,22 +4,11 @@ import { message } from 'ant-design-vue'
 
 const router = useRouter()
 
-const data: any[] = [
-  {
-    title: 'Step 1: Click the Start button below.',
-  },
-  {
-    title: "Step 2: You will be prompted to a page with a chatbot and Document preview",
-  },
-  {
-    title: "Step 3: Use the chat assistant to select the design document required'",
-  },
-  {
-    title: 'Step 4: Answer a few questions from the AI assistant.',
-  },
-  {
-    title: 'Step 5: Download your fully filled-out document.',
-  },
+const steps: string[] = [
+  'Step 1: Click the Start button below.',
+  "Step 2: Upload a PDF document you'd like to autofill.",
+  'Step 3: Answer a few questions from the AI assistant.',
+  'Step 4: Download your fully filled-out document.',
 ]
 
 function handleStart() {
@@ -27,112 +16,132 @@ function handleStart() {
     router.push({ name: 'EditorView' })
   } catch (err) {
     console.error(err)
-    message.error('Upload failed.')
+    message.error('Navigation failed.')
   }
 }
 </script>
 
 <template>
-  <a-layout style="min-height: 100vh; min-width: 100vw">
-    <a-layout-content class="content-center">
-      <a-card :bordered="true" class="upload-card">
-        <img src="../assets/logo.png" width="250px" alt="Logo" />
-        <h1>Welcome to Vantive's Smart Document Assistant</h1>
-        <p>Automatically fill out your document templates using intelligent assistance.</p>
-        <a-list item-layout="horizontal" :data-source="data">
-          <template #renderItem="{ item }">
-            <a-list-item>
-              <a-list-item-meta>
-                <template #title>
-                  <p>{{ item.title }}</p>
-                </template>
-              </a-list-item-meta>
-            </a-list-item>
-          </template>
-        </a-list>
-        <a-button block type="primary" class="mt-2" @click="handleStart()"> Start </a-button>
-      </a-card>
-    </a-layout-content>
-  </a-layout>
+  <div class="page-wrapper">
+    <div class="container">
+      <!-- Replace the src below if your image path is different -->
+      <img src="../assets/intro-image.png" alt="Welcome" class="intro-image" />
+
+      <h1>Welcome to Vantive's Smart Document Assistant</h1>
+
+      <p class="lead">
+        Automatically fill out your document templates using intelligent assistance.
+      </p>
+
+      <ul class="instructions">
+        <li>
+          <strong>Step 1:</strong> Click the <strong>Start</strong> button below.
+        </li>
+        <li>
+          <strong>Step 2:</strong> Upload a <strong>PDF</strong> document you'd like to autofill.
+        </li>
+        <li>
+          <strong>Step 3:</strong> Answer a few questions from the AI assistant.
+        </li>
+        <li>
+          <strong>Step 4:</strong> Download your fully filled-out document.
+        </li>
+      </ul>
+
+      <a-button type="primary" size="large" class="btn-start" @click="handleStart">
+        Start
+      </a-button>
+    </div>
+  </div>
 </template>
 
 <style scoped>
-.content-center {
-  display: flex;
-  justify-content: center;
-  flex-direction: column;
-  align-items: center;
-  height: 100%;
-  padding: 24px;
+/* PAGE BACKGROUND */
+.page-wrapper {
   background: linear-gradient(to bottom right, #f4efff, #e8ddff);
+  font-family: 'Inter', sans-serif;
+  height: 100vh;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.upload-card {
-  width: 100%;
-  max-width: 600px;
+/* CONTAINER CARD */
+.container {
+  text-align: center;
+  max-width: 720px;
+  padding: 40px 30px;
+  background-color: #fff;
+  border-radius: 18px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.1);
   animation: fadeIn 1s ease-in-out;
 }
 
-/* ✨ Fade-in animation keyframes */
+/* FADE-IN ANIMATION */
 @keyframes fadeIn {
-  0% {
+  from {
     opacity: 0;
-    transform: translateY(20px);
+    transform: translateY(30px);
   }
-  100% {
+  to {
     opacity: 1;
     transform: translateY(0);
   }
 }
 
-.drop-zone {
-  position: relative;
-  border: 2px dashed #d9d9d9;
-  padding: 40px;
-  border-radius: 8px;
-  cursor: pointer;
+/* HEADER */
+h1 {
+  font-size: 2.4rem;
+  font-weight: 700;
+  color: #4b0082;
   margin-bottom: 20px;
-  text-align: center;
-  transition: all 0.3s;
 }
 
-.drop-zone.dragging {
-  border-color: #1890ff;
-  background-color: #e6f7ff;
+/* LEAD TEXT */
+.lead {
+  font-size: 1.15rem;
+  color: #444;
+  margin-bottom: 25px;
 }
 
-.drop-zone input[type='file'] {
-  position: absolute;
-  inset: 0;
-  opacity: 0;
-  cursor: pointer;
-}
-
-.preview-section {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-}
-
-.file-name {
-  font-weight: 500;
-  color: #333;
-  text-align: center;
-}
-
-.preview-img {
-  max-width: 250px;
-  max-height: 300px;
-  object-fit: contain;
-  border: 1px solid #f0f0f0;
-  border-radius: 4px;
-}
-
-.nutrient-container {
+/* IMAGE */
+.intro-image {
+  max-height: 280px;
+  margin-bottom: 25px;
   width: 100%;
-  height: 400px;
-  border: 1px solid #f0f0f0;
-  border-radius: 4px;
+  object-fit: contain;
 }
+
+/* BUTTON STYLE */
+.btn-start {
+  font-size: 1.1rem;
+  padding: 12px 30px;
+  border-radius: 8px;
+  margin-top: 25px;
+}
+
+/* INSTRUCTION LIST */
+.instructions {
+  text-align: left;
+  margin-top: 25px;
+  color: #333;
+  font-size: 0.97rem;
+  list-style: none;
+  padding-left: 0;
+}
+
+.instructions li {
+  margin-bottom: 12px;
+  line-height: 1.5;
+}
+
+/* RESPONSIVE DESIGN */
+@media (max-width: 576px) {
+  h1 {
+    font-size: 1.8rem;
+  }
+}
+<link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet" />
+
 </style>
