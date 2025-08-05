@@ -24,7 +24,6 @@ function handleStart() {
 <template>
   <div class="page-wrapper">
     <div class="container">
-      <!-- Replace the src below if your image path is different -->
       <img src="../assets/intro-image.png" alt="Welcome" class="intro-image" />
 
       <h1>Welcome to Vantive's Smart Document Assistant</h1>
@@ -56,6 +55,9 @@ function handleStart() {
 </template>
 
 <style scoped>
+/* ✅ FONT IMPORT */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+
 /* PAGE BACKGROUND */
 .page-wrapper {
   background: linear-gradient(to bottom right, #f4efff, #e8ddff);
@@ -142,6 +144,4 @@ h1 {
     font-size: 1.8rem;
   }
 }
-<link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet" />
-
 </style>
