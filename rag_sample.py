@@ -1,124 +1,141 @@
+# step5_rag_app.py
+# Implements ONLY Step 5 from your doc:
+#  - Step 5.1: query embedding + hybrid search (semantic + vector)
+#  - Step 5.2: pass concatenated chunk context to AOAI chat for the answer
+#
+# Uses env vars from your .env (no hardcoded secrets).
+
+import os
 import streamlit as st
+from dotenv import load_dotenv
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
-import json
-import os
-import base64
 from openai import AzureOpenAI
 
-from dotenv import load_dotenv
-load_dotenv()
+load_dotenv()  # read .env
 
+# ─────────────────────────────
+# Env config required for Step 5
+# ─────────────────────────────
+AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")           # https://<search>.search.windows.net
+AZURE_SEARCH_INDEX    = os.getenv("AZURE_SEARCH_INDEX")              # your index name
+AZURE_SEARCH_API_KEY  = os.getenv("AZURE_SEARCH_API_KEY")            # admin/query key
+SEMANTIC_CONFIG_NAME  = os.getenv("SEMANTIC_CONFIG_NAME", "default")
 
-# Replace with your actual values with vector search enabled
-# Ensure you have the correct endpoint, index name, and API key for your Azure Search service
-endpoint = "your-search-endpoint"  # e.g., "https://your-search-service.search.windows.net"
-index_name = "your-index-name"
-api_key = "your-api-key"
-query_text = "your-query-text"  # e.g., "What is the capital of France?"
+# Index field names from your "Import & Vectorize" wizard
+CHUNK_TEXT_FIELD      = os.getenv("CHUNK_TEXT_FIELD", "chunk")       # text field (e.g., "chunk" or "content")
+CHUNK_VECTOR_FIELD    = os.getenv("CHUNK_VECTOR_FIELD", "text_vector")  # vector field
 
-# Create the SearchClient
+# Azure OpenAI (embedding + chat)
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")           # https://<aoai>.openai.azure.com/
+AZURE_OPENAI_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_API_VER  = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+EMBED_DEPLOYMENT      = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")  # e.g., "text-embedding-3-small"
+CHAT_DEPLOYMENT       = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")       # e.g., "gpt-4o"
+
+DEFAULT_QUERY         = os.getenv("QUERY_DEFAULT", "What is the capital of France?")
+
+# ─────────────────────────────
+# Clients
+# ─────────────────────────────
+# Azure AI Search
 search_client = SearchClient(
-    endpoint=endpoint, index_name=index_name, credential=AzureKeyCredential(api_key)
+    endpoint=AZURE_SEARCH_ENDPOINT,
+    index_name=AZURE_SEARCH_INDEX,
+    credential=AzureKeyCredential(AZURE_SEARCH_API_KEY),
 )
 
-# Perform the search with semantic configuration
-results = search_client.search(
-    search_text=query_text,
-    query_type="semantic",
-    query_answer="extractive|count-3",
-    query_caption="extractive",
-    semantic_configuration_name="your-semantic-configuration-name",  # e.g., "default"
-    select="*",
-    include_total_count=True,
-    query_caption_highlight_enabled=True,
-)
-# Convert results to a list for easier processing
-results = list(results)
-for result in results:
-    print("test1----", result["chunk"])
-
-# Azure OpenAI Configuration
-OPENAI_API_KEY = "your-openai-api-key"
-endpoint = os.getenv("ENDPOINT_URL", "your-openai-endpoint")  # e.g., "https://your-openai-service.openai.azure.com/"
-deployment = os.getenv("DEPLOYMENT_NAME", "your-deployment-name")  # e.g., "gpt-35-turbo"
-subscription_key = os.getenv("AZURE_OPENAI_API_KEY", OPENAI_API_KEY)
-
-client = AzureOpenAI(
-    azure_endpoint=endpoint,
-    api_key=subscription_key,
-    api_version="2025-01-01-preview",
+# Azure OpenAI (one client for embeddings + chat)
+aoai = AzureOpenAI(
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VER,
 )
 
-# Display results in Streamlit
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Filtered Response", "First @search.answers", "First Chunk", "OpenAI Response"]
-)
+# ─────────────────────────────
+# Step 5.1 — embed + hybrid search
+# ─────────────────────────────
+def get_embedding(text: str) -> list[float]:
+    resp = aoai.embeddings.create(model=EMBED_DEPLOYMENT, input=text)
+    return resp.data[0].embedding
 
-with tab1:
-    # Display the whole response in JSON format
-    st.write("Full Response:")
-    st.json(results)
+def search_documents(user_query: str, k: int = 10):
+    # Build query embedding
+    query_vector = get_embedding(user_query)
 
-with tab2:
-    # Display the first "@search.answers" response
-    for result in results:
-        if "@search.answers" in result and result["@search.answers"]:
-            st.write("First @search.answers:", result["@search.answers"][0]["text"])
-            break
-    else:
-        st.write("No @search.answers found in the results.")
+    # Hybrid retrieval: semantic + vector
+    results_iter = search_client.search(
+        search_text=user_query,                         # semantic boost
+        query_type="semantic",
+        semantic_configuration_name=SEMANTIC_CONFIG_NAME,
+        vector_queries=[{
+            "vector": query_vector,
+            "k": k,
+            "fields": CHUNK_VECTOR_FIELD,
+            "kind": "vector",
+        }],
+        select="*",
+        include_total_count=True,
+    )
 
-with tab3:
-    # Display the first "chunk" value
-    first_chunk = None
-    for result in results:
-        if "chunk" in result:
-            first_chunk = result["chunk"]
-            st.write("First Chunk:", first_chunk)
-            break
-    else:
-        st.write("No chunk found in the results.")
+    docs = list(results_iter)
+    # Concatenate chunk text for Step 5.2
+    context = "\n".join([doc.get(CHUNK_TEXT_FIELD, "[no chunk]") for doc in docs])
+    return docs, context
 
-with tab4:
-    if first_chunk:
-        # Pass the value of result["chunk"] and query_text to Azure OpenAI
-        chat_prompt = [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "You are an AI assistant that helps people find information.",
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"{query_text}: Give only {query_text} related Details from {first_chunk}",
-                    }
-                ],
-            },
-        ]
+# ─────────────────────────────
+# Step 5.2 — generate answer with chat
+# ─────────────────────────────
+def generate_answer(context: str, user_query: str) -> str:
+    prompt = f"""Use the context below to answer the question.
 
-        completion = client.chat.completions.create(
-            model=deployment,
-            messages=chat_prompt,
-            max_tokens=1000,
-            temperature=0.2,
-            top_p=0.95,
-            frequency_penalty=0,
-            presence_penalty=0,
-            stop=None,
-            stream=False,
-        )
+Context:
+{context}
 
-        # Display the deterministic response in Tab 4
-        # st.write("OpenAI Response:", completion.to_json())
-        st.write("OpenAI Response:", completion.choices[0].message.content)
-    else:
-        st.write("No chunk available to send to Azure OpenAI.")
+Question:
+{user_query}
+"""
+    resp = aoai.chat.completions.create(
+        model=CHAT_DEPLOYMENT,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=700,
+    )
+    return resp.choices[0].message.content.strip()
+
+# ─────────────────────────────
+# Minimal UI for Step 5
+# ─────────────────────────────
+st.set_page_config(page_title="Step 5 RAG — Azure AI Search + AOAI", layout="wide")
+st.title("Step 5: RAG (Hybrid Search + Chat)")
+
+query_text = st.text_input("Your question", value=DEFAULT_QUERY)
+k = st.slider("Top K chunks", 3, 20, 10, 1)
+
+if query_text.strip():
+    try:
+        docs, context = search_documents(query_text, k=k)
+
+        st.subheader("Top hits (first 5)")
+        st.json(docs[:min(5, len(docs))])
+
+        st.subheader(f"Concatenated context from '{CHUNK_TEXT_FIELD}'")
+        st.code(context[:3000] + ("..." if len(context) > 3000 else ""))
+
+        st.subheader("Answer")
+        if context.strip():
+            answer = generate_answer(context, query_text)
+            st.write(answer)
+        else:
+            st.warning(
+                f"No text found in field '{CHUNK_TEXT_FIELD}'. "
+                "Check your index field names and that your index has data."
+            )
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+        st.info("Verify .env values (endpoints, keys, deployment names) and index field names.")
+else:
+    st.info("Enter a question to run Step 5.")
+
  
