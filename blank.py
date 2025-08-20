@@ -1,9 +1,12 @@
-# detect_blanks.py  (updated)
+# detect_blanks.py — strict blank detector for Azure Document Intelligence (Document Intelligence / Form Recognizer)
+# Python 3.9+
+# pip install azure-ai-formrecognizer>=3.2 azure-core python-dotenv
+
 import os
 import re
 import json
 import argparse
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
@@ -17,16 +20,19 @@ PLACEHOLDER_RE = re.compile(
 )
 LABEL_WORD_RE = re.compile(r"(name|date|title|author|email|id|amount|by|rev|revision|document)\b", re.IGNORECASE)
 
-def norm(s: str) -> str:
+def norm(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
-def is_placeholder_or_empty(s: str) -> bool:
+def is_placeholder_or_empty(s: Optional[str]) -> bool:
     s = (s or "").strip()
     return (not s) or bool(PLACEHOLDER_RE.match(s))
 
-def poly_to_bbox(polygon) -> Tuple[float, float, float, float]:
-    xs = [p.x for p in polygon]
-    ys = [p.y for p in polygon]
+def poly_to_bbox(poly) -> Tuple[float, float, float, float]:
+    # guard for weird polygons
+    xs = [p.x for p in poly] if poly else []
+    ys = [p.y for p in poly] if poly else []
+    if not xs or not ys:
+        return (0, 0, 0, 0)
     return (min(xs), min(ys), max(xs), max(ys))
 
 def bbox_to_dict(b):
@@ -41,86 +47,110 @@ def rect_overlap(a, b) -> float:
     iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
     return iw * ih
 
-def rect_area(b) -> float:
-    x0, y0, x1, y1 = b
-    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
-
-def min_gap_threshold(avg_char_w: float, page_w: float) -> float:
-    return max(1.5 * max(avg_char_w, 1.0), 0.05 * page_w)
-
-def has_real_words(words, check_rect, margin=0.0) -> bool:
-    """Return True if any non-placeholder word overlaps the rect (with optional padding)."""
-    x0, y0, x1, y1 = check_rect
+def has_real_words(words, rect, margin=0.0) -> bool:
+    """True if any non-placeholder word overlaps the rect (with optional padding)."""
+    x0, y0, x1, y1 = rect
     padded = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
-    for w in words:
+    for w in words or []:
+        if not getattr(w, "polygon", None):
+            continue
         wb = poly_to_bbox(w.polygon)
         if rect_overlap(wb, padded) > 0:
             if not is_placeholder_or_empty(w.content):
                 return True
     return False
 
-# -----------------------
-# Detection
-# -----------------------
-def detect_table_blanks(result, words_by_page, debug_counts) -> List[Dict[str, Any]]:
-    blanks = []
-    for t_idx, table in enumerate(result.tables or []):
-        # collect column headers
-        col_headers = {}
-        for cell in table.cells:
-            if getattr(cell, "kind", None) == "columnHeader" or cell.row_index == 0:
-                col_headers[cell.column_index] = norm(cell.content)
+def grow(rect, left=0, up=0, right=0, down=0):
+    x0, y0, x1, y1 = rect
+    return (x0 - left, y0 - up, x1 + right, y1 + down)
 
-        for cell in table.cells:
-            # skip header cells
-            if getattr(cell, "kind", None) in {"columnHeader", "rowHeader"} or cell.row_index == 0:
+def min_gap_threshold(avg_char_w: float, page_w: float) -> float:
+    return max(1.5 * max(avg_char_w, 1.0), 0.05 * page_w)
+
+# -----------------------
+# Debug (optional)
+# -----------------------
+def debug_overview(result):
+    print("\n=== DI Overview ===")
+    print(f"pages={len(result.pages or [])} tables={len(result.tables or [])} kv_pairs={len(result.key_value_pairs or [])}")
+    for p in (result.pages or []):
+        print(f"  Page {p.page_number}: words={len(p.words or [])}, lines={len(p.lines or [])}, marks={len(p.selection_marks or [])}, size=({p.width}x{p.height})")
+
+# -----------------------
+# Detectors
+# -----------------------
+def detect_table_blanks(result, words_by_page, skipped) -> List[Dict[str, Any]]:
+    """Flag only when (a) cell has geometry, (b) cell text is empty/placeholder, and (c) there are NO words in that cell box."""
+    out = []
+    for t_idx, t in enumerate(result.tables or []):
+        # headers: explicit kind wins; else first non-empty row
+        col_headers: Dict[int, str] = {}
+        header_rows = set()
+        for c in t.cells:
+            if getattr(c, "kind", None) == "columnHeader":
+                col_headers[c.column_index] = norm(c.content)
+                header_rows.add(c.row_index)
+        if not col_headers:
+            row_counts: Dict[int, int] = {}
+            for c in t.cells:
+                if norm(c.content):
+                    row_counts[c.row_index] = row_counts.get(c.row_index, 0) + 1
+            if row_counts:
+                first_row = min((r for r, n in row_counts.items() if n >= 2), default=None)
+                if first_row is not None:
+                    for c in t.cells:
+                        if c.row_index == first_row:
+                            col_headers[c.column_index] = norm(c.content)
+                    header_rows.add(first_row)
+
+        for c in t.cells:
+            if c.row_index in header_rows:
                 continue
-
-            txt = norm(cell.content)
-            # Use cell bbox to double-check real text isn't there (OCR sometimes doesn't pipe content up)
-            if cell.bounding_regions:
-                reg = cell.bounding_regions[0]
-                page_no = reg.page_number
-                cell_bbox = poly_to_bbox(reg.polygon)
-                # If any real words are inside, it's NOT blank → skip
-                if has_real_words(words_by_page.get(page_no, []), cell_bbox, margin=0.0):
-                    debug_counts["tiny_gap_noise"] += 1
-                    continue
-
-            if is_placeholder_or_empty(txt):
-                col_lbl = col_headers.get(cell.column_index, f"Col {cell.column_index+1}")
+            if not c.bounding_regions:
+                continue
+            reg = c.bounding_regions[0]
+            page_no = reg.page_number
+            cell_rect = poly_to_bbox(reg.polygon)
+            # strict: must be geometrically empty of words
+            if has_real_words(words_by_page.get(page_no), cell_rect):
+                skipped["table_words_present"] += 1
+                continue
+            # strict: text must be empty/placeholder too
+            if is_placeholder_or_empty(norm(c.content)):
+                col_lbl = col_headers.get(c.column_index, f"Col {c.column_index+1}")
                 row_lbl = None
-                # attempt a row header in same row
-                for rc in table.cells:
-                    if rc.row_index == cell.row_index and getattr(rc, "kind", None) == "rowHeader":
-                        row_lbl = norm(rc.content)
-                        break
-                label = " | ".join([s for s in [row_lbl, col_lbl] if s]) or f"Table {t_idx+1} R{cell.row_index+1}C{cell.column_index+1}"
+                for rc in t.cells:
+                    if rc.row_index == c.row_index and getattr(rc, "kind", None) == "rowHeader":
+                        row_lbl = norm(rc.content); break
+                label = " | ".join([x for x in [row_lbl, col_lbl] if x]) or f"Table {t_idx+1} R{c.row_index+1}C{c.column_index+1}"
+                out.append({
+                    "page": page_no,
+                    "bbox": bbox_to_dict(cell_rect),
+                    "label": label,
+                    "source": "table",
+                    "reason": "table_cell_empty",
+                    "confidence": 0.90
+                })
+    return out
 
-                if cell.bounding_regions:
-                    reg = cell.bounding_regions[0]
-                    blanks.append({
-                        "page": reg.page_number,
-                        "bbox": bbox_to_dict(poly_to_bbox(reg.polygon)),
-                        "label": label,
-                        "source": "table",
-                        "reason": "table_cell_empty",
-                        "confidence": 0.90
-                    })
-    return blanks
-
-def detect_kv_blanks(result, pages_by_no, words_by_page, debug_counts) -> List[Dict[str, Any]]:
-    blanks = []
+def detect_kv_blanks(result, pages_by_no, words_by_page, skipped) -> List[Dict[str, Any]]:
+    """
+    Strict KV: only flag if
+      - value text is empty/placeholder OR low confidence,
+      - AND there are NO real words inside the value box,
+      - AND there are NO real words immediately to the right of the key (same line height).
+    """
+    out = []
     for kv in (result.key_value_pairs or []):
         key_txt = norm(getattr(kv.key, "content", "") if kv.key else "")
-        val_obj  = getattr(kv, "value", None)
-        val_txt  = norm(getattr(val_obj, "content", "") if val_obj else "")
-        val_conf = getattr(val_obj, "confidence", 0.0) if val_obj else 0.0
+        val = getattr(kv, "value", None)
+        val_txt  = norm(getattr(val, "content", "") if val else "")
+        val_conf = getattr(val, "confidence", 0.0) if val else 0.0
 
-        # choose a primary region to inspect
+        # primary region: prefer value region; else key region as proxy
         region = None
-        if val_obj and getattr(val_obj, "bounding_regions", None):
-            region = val_obj.bounding_regions[0]
+        if val and getattr(val, "bounding_regions", None):
+            region = val.bounding_regions[0]
         elif kv.key and getattr(kv.key, "bounding_regions", None):
             region = kv.key.bounding_regions[0]
         if not region:
@@ -130,20 +160,26 @@ def detect_kv_blanks(result, pages_by_no, words_by_page, debug_counts) -> List[D
         page = pages_by_no.get(page_no)
         page_w = page.width if page else 1000.0
 
-        # If value is missing/low confidence → before flagging, check if words exist immediately to the right of the key
-        # Build a small "value search" rect to the right of key region to catch cases like "Document #: F2000"
-        key_reg = kv.key.bounding_regions[0] if (kv.key and kv.key.bounding_regions) else region
-        kx0, ky0, kx1, ky1 = poly_to_bbox(key_reg.polygon)
-        line_height = max(8.0, (ky1 - ky0))
-        search_rect = (kx1, ky0, min(kx1 + 0.25 * page_w, kx1 + 4 * (kx1 - kx0)), ky0 + line_height)
+        # 1) check value box itself (if value has a bbox)
+        value_has_words = False
+        if val and getattr(val, "bounding_regions", None):
+            vrect = poly_to_bbox(val.bounding_regions[0].polygon)
+            value_has_words = has_real_words(words_by_page.get(page_no), vrect)
+
+        # 2) check immediate right of key (captures cases like "Document #: F2000")
+        if kv.key and getattr(kv.key, "bounding_regions", None):
+            kx0, ky0, kx1, ky1 = poly_to_bbox(kv.key.bounding_regions[0].polygon)
+            line_h = max(8.0, (ky1 - ky0))
+            search_rect = (kx1, ky0, min(kx1 + 0.25 * page_w, kx1 + 4 * (kx1 - kx0)), ky0 + line_h)
+            right_has_words = has_real_words(words_by_page.get(page_no), search_rect)
+        else:
+            right_has_words = False
 
         if (is_placeholder_or_empty(val_txt) or val_conf < 0.25):
-            # If there are real words in the value search region → it's filled; skip
-            if has_real_words(words_by_page.get(page_no, []), search_rect, margin=0.0):
-                debug_counts["tiny_gap_noise"] += 1
+            if value_has_words or right_has_words:
+                skipped["kv_value_present"] += 1
                 continue
-
-            blanks.append({
+            out.append({
                 "page": page_no,
                 "bbox": bbox_to_dict(poly_to_bbox(region.polygon)),
                 "label": key_txt or "KeyValue",
@@ -151,66 +187,68 @@ def detect_kv_blanks(result, pages_by_no, words_by_page, debug_counts) -> List[D
                 "reason": "kv_missing_or_low_conf",
                 "confidence": 0.80
             })
-    return blanks
+    return out
 
 def detect_selection_mark_blanks(result) -> List[Dict[str, Any]]:
-    blanks = []
-    for page in (result.pages or []):
-        for mark in (page.selection_marks or []):
-            if mark.state and str(mark.state).lower() == "unselected":
-                if mark.polygon:
-                    blanks.append({
-                        "page": page.page_number,
-                        "bbox": bbox_to_dict(poly_to_bbox(mark.polygon)),
-                        "label": "Checkbox/Radio",
-                        "source": "selection_mark",
-                        "reason": "unselected_selection_mark",
-                        "confidence": 0.85
-                    })
-    return blanks
+    out = []
+    for p in (result.pages or []):
+        for m in (p.selection_marks or []):
+            if getattr(m, "polygon", None) and str(m.state).lower() == "unselected":
+                out.append({
+                    "page": p.page_number,
+                    "bbox": bbox_to_dict(poly_to_bbox(m.polygon)),
+                    "label": "Checkbox/Radio",
+                    "source": "selection_mark",
+                    "reason": "unselected_selection_mark",
+                    "confidence": 0.85
+                })
+    return out
 
-def detect_label_gap_blanks(result, pages_by_no, words_by_page, debug_counts, enable=True) -> List[Dict[str, Any]]:
+def detect_label_gap_blanks(result, words_by_page, enable=False) -> List[Dict[str, Any]]:
+    """
+    VERY conservative: only if
+      - line ends with ':'
+      - big right-side gap with no words
+      - AND no words directly below that gap (wrapped value on next line)
+    Default: disabled for strictness.
+    """
     if not enable:
         return []
-    blanks = []
-    for page in (result.pages or []):
-        page_no = page.page_number
-        page_w = page.width or 1000.0
-        words = words_by_page.get(page_no, [])
-        for line in (page.lines or []):
+    out = []
+    for p in (result.pages or []):
+        page_no = p.page_number
+        page_w  = p.width or 1000.0
+        words   = words_by_page.get(page_no) or []
+        for line in (p.lines or []):
             text = norm(line.content)
-            if not text:
+            if not text or not text.endswith(":"):
                 continue
-            looks_label = (text.endswith(":") or LABEL_WORD_RE.search(text) is not None)
-            if not looks_label:
-                continue
-
             lx0, ly0, lx1, ly1 = poly_to_bbox(line.polygon)
             line_w = max(lx1 - lx0, 1.0)
             avg_char_w = line_w / max(len(text), 10)
             min_gap = min_gap_threshold(avg_char_w, page_w)
 
-            # Use the right 35% of the line as the candidate gap region
-            gap_start = lx0 + 0.65 * line_w
-            gap_end   = lx1
-            gap_rect  = (gap_start, ly0, gap_end, ly1)
-            gap_w     = max(0.0, gap_end - gap_start)
+            # Right 35% of line as candidate gap
+            gap = (lx0 + 0.65*line_w, ly0, lx1, ly1)
+            gap_w = max(0.0, gap[2]-gap[0])
 
-            # If any real word sits in the gap → not a blank
-            if has_real_words(words, gap_rect, margin=0.0):
-                debug_counts["tiny_gap_noise"] += 1
+            # 1) words in gap? -> not blank
+            if has_real_words(words, gap):
                 continue
-
+            # 2) words directly below gap (wrap to next line)? -> not blank
+            below = grow(gap, up=0, down=(ly1-ly0)*0.9)
+            if has_real_words(words, below):
+                continue
             if gap_w >= min_gap:
-                blanks.append({
+                out.append({
                     "page": page_no,
-                    "bbox": bbox_to_dict(gap_rect),
-                    "label": text.rstrip(":"),
+                    "bbox": bbox_to_dict(gap),
+                    "label": text[:-1],  # strip ':'
                     "source": "label_gap",
                     "reason": "label_right_gap",
                     "confidence": 0.65
                 })
-    return blanks
+    return out
 
 # -----------------------
 # Runner
@@ -235,25 +273,29 @@ def main():
     key = os.getenv("AZURE_DI_KEY")
     assert endpoint and key, "Set AZURE_DI_ENDPOINT and AZURE_DI_KEY in your environment or .env"
 
-    parser = argparse.ArgumentParser(description="Detect generic blanks with Azure Document Intelligence")
+    parser = argparse.ArgumentParser(description="Strict blank detector (Azure Document Intelligence)")
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", type=str, help="Local file path (PDF, TIFF, JPG, PNG, etc.)")
     src.add_argument("--url", type=str, help="Public/SAS URL to the document")
     parser.add_argument("--include-label-gaps", action="store_true",
-                        help="Also flag label→gap blanks (heuristic). Defaults to False.")
-    parser.add_argument("--debug", action="store_true", help="Print skip counts and per-page summary.")
+                        help="Also flag label→gap blanks (very conservative). OFF by default.")
+    parser.add_argument("--debug", action="store_true", help="Print DI overview and per-page summary.")
     args = parser.parse_args()
 
     result = analyze_document(endpoint, key, file_path=args.file, url=args.url)
+
+    if args.debug:
+        debug_overview(result)
+
     pages_by_no, words_by_page = build_page_indexes(result)
 
-    debug_counts = {"tiny_gap_noise": 0}
+    skipped = {"table_words_present": 0, "kv_value_present": 0}
 
     blanks: List[Dict[str, Any]] = []
-    blanks += detect_table_blanks(result, words_by_page, debug_counts)
-    blanks += detect_kv_blanks(result, pages_by_no, words_by_page, debug_counts)
+    blanks += detect_table_blanks(result, words_by_page, skipped)
+    blanks += detect_kv_blanks(result, pages_by_no, words_by_page, skipped)
     blanks += detect_selection_mark_blanks(result)
-    blanks += detect_label_gap_blanks(result, pages_by_no, words_by_page, debug_counts, enable=args.include_label_gaps)
+    blanks += detect_label_gap_blanks(result, words_by_page, enable=args.include_label_gaps)
 
     # Sort by page, then source priority
     priority = {"table": 0, "selection_mark": 1, "key_value": 2, "label_gap": 3}
@@ -262,17 +304,18 @@ def main():
     print(json.dumps({"blanks": blanks}, indent=2))
 
     if args.debug:
-        # per-page summary + tiny-gap noise avoided
         per_page = {}
         for b in blanks:
             per_page.setdefault(b["page"], 0)
             per_page[b["page"]] += 1
         print("\n--- Summary ---")
-        for p in sorted(per_page.keys()):
-            print(f"Page {p}: {per_page[p]} blanks")
-        if not per_page:
+        if per_page:
+            for p in sorted(per_page.keys()):
+                print(f"Page {p}: {per_page[p]} blanks")
+        else:
             print("No blanks detected.")
-        print(f"Skipped due to tiny_gap_noise (value tokens found in/near bbox): {debug_counts['tiny_gap_noise']}")
+        print(f"Skipped table cells with words present: {skipped['table_words_present']}")
+        print(f"Skipped KV because a value word was present: {skipped['kv_value_present']}")
 
 if __name__ == "__main__":
     main()
