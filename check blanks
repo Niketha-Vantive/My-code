@@ -1,0 +1,362 @@
+{
+  "blanks": [
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 2.0953,
+        "x1": 4.3499,
+        "y1": 2.3212
+      },
+      "label": "Printed Name",
+      "source": "table",      
+      "confidence": 0.9       
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 2.0885,
+        "x1": 7.5697,
+        "y1": 2.3212
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 2.3212,
+        "x1": 4.3499,
+        "y1": 2.5607
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 2.3212,
+        "x1": 7.5697,
+        "y1": 2.5607
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 2.5607,
+        "x1": 4.3499,
+        "y1": 2.8003
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 2.5607,
+        "x1": 7.5697,
+        "y1": 2.8003
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 2.8003,
+        "x1": 4.3499,
+        "y1": 3.0398
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 2.8003,
+        "x1": 7.5697,
+        "y1": 3.0398
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 3.0398,
+        "x1": 4.3499,
+        "y1": 3.2794
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 3.0398,
+        "x1": 7.5697,
+        "y1": 3.2794
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 3.2794,
+        "x1": 4.3499,
+        "y1": 3.5189
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 3.2794,
+        "x1": 7.5697,
+        "y1": 3.5189
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 3.5189,
+        "x1": 4.3499,
+        "y1": 3.7585
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 3.5189,
+        "x1": 7.5697,
+        "y1": 3.7585
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 3.7585,
+        "x1": 4.3499,
+        "y1": 3.9912
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 3.7448,
+        "x1": 7.5697,
+        "y1": 3.9912
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 3.9912,
+        "x1": 4.3499,
+        "y1": 4.2307
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 3.9843,
+        "x1": 7.5697,
+        "y1": 4.2307
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 4.2307,
+        "x1": 4.3499,
+        "y1": 4.4702
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 4.2307,
+        "x1": 7.5697,
+        "y1": 4.4702
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 4.4702,
+        "x1": 4.3499,
+        "y1": 4.8604
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 4.4702,
+        "x1": 7.5697,
+        "y1": 4.8604
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 2.3496,
+        "y0": 4.8604,
+        "x1": 4.3499,
+        "y1": 5.0999
+      },
+      "label": "Printed Name",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1037,
+        "y0": 4.8604,
+        "x1": 7.5697,
+        "y1": 5.0999
+      },
+      "label": "Date",
+      "source": "table",
+      "confidence": 0.9
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 4.3216,
+        "y0": 0.5204,
+        "x1": 4.718,
+        "y1": 0.6684
+      },
+      "label": "Document #:",
+      "source": "key_value",
+      "confidence": 0.8
+    },
+    {
+      "page": 1,
+      "bbox": {
+        "x0": 6.1124,
+        "y0": 0.5204,
+        "x1": 6.1888,
+        "y1": 0.6636
+      },
+      "label": "Revision:",
+      "source": "key_value",
+      "confidence": 0.8
+    },
+    {
+      "page": 2,
+      "bbox": {
+        "x0": 4.3169,
+        "y0": 0.5204,
+        "x1": 4.7132,
+        "y1": 0.6684
+      },
+      "label": "Document #:",
+        "x0": 4.3169,
+        "y0": 0.5204,
+        "x1": 4.7132,
+        "y1": 0.6684
+      },
+      "label": "Document #:",
+      },
+      "label": "Document #:",
+      "label": "Document #:",
+      "source": "key_value",
+      "confidence": 0.8
+      "confidence": 0.8
+    },
+    {
+      "page": 2,
+      "bbox": {
+        "x0": 6.1028,
+        "y0": 0.5252,
+        "x1": 6.1888,
+        "y1": 0.6636
+      },
+      "label": "Revision:",
+      "source": "key_value",
+      "confidence": 0.8
+    },
+    {
+      "page": 2,
+      "bbox": {
+        "x0": 1.3132,
+        "y0": 0.7639,
+        "x1": 6.0216,
+        "y1": 0.9262
+      },
+      "label": "TITLE:",
+      "source": "key_value",
+      "confidence": 0.8
+    }
+  ]
+}
