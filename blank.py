@@ -1,4 +1,4 @@
-# detect_blanks.py — strict blank detector + red-circle overlay
+# detect_blanks.py — strict blank detector + small-circle overlay & labels
 # Python 3.9+
 # pip install azure-ai-formrecognizer>=3.2 azure-core python-dotenv pymupdf
 
@@ -10,7 +10,6 @@ from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
-
 import fitz  # PyMuPDF
 
 # -----------------------
@@ -226,22 +225,34 @@ def detect_label_gap_blanks(result, words_by_page, enable=False) -> List[Dict[st
     return out
 
 # -----------------------
-# Overlay (red circles)
+# Overlay (small circles + optional rectangle + labels)
 # -----------------------
-def overlay_red_circles(input_pdf_path: str, output_pdf_path: str, blanks: List[Dict[str, Any]], di_pages: Dict[int, Any]):
+def overlay_marks(input_pdf_path: str,
+                  output_pdf_path: str,
+                  blanks: List[Dict[str, Any]],
+                  di_pages: List[Any],
+                  circle_scale: float = 0.04,
+                  draw_outline: bool = False,
+                  label_in_rect: bool = False):
     """
-    Draw a red circle at each blank's center.
-    Coordinate mapping:
-      - Azure DI gives (x,y) in DI page units; DI provides page.width/page.height.
-      - PyMuPDF page.rect is in points; we scale per page: sx = page.rect.width / di_page.width, sy = page.rect.height / di_page.height.
+    Draw a small red circle at the top-left boundary inside each blank.
+    - circle_scale: fraction of min(blank_width, blank_height) to set radius (clamped).
+    - draw_outline: draw a thin rectangle around the blank area.
+    - label_in_rect: write 'Blank N' very small near the top-left inside the rectangle.
     """
+    if not blanks:
+        # still create a copy so user gets a file
+        doc = fitz.open(input_pdf_path)
+        os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+        doc.save(output_pdf_path, deflate=True)
+        doc.close()
+        return
+
     os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
     doc = fitz.open(input_pdf_path)
-
-    # index DI pages by number for width/height
     di_page_map = {p.page_number: p for p in di_pages}
 
-    for b in blanks:
+    for idx, b in enumerate(blanks, start=1):
         pno = b["page"]  # 1-based
         if pno < 1 or pno > len(doc):
             continue
@@ -250,28 +261,52 @@ def overlay_red_circles(input_pdf_path: str, output_pdf_path: str, blanks: List[
         if not di_p:
             continue
 
-        # scales
+        # scales (DI units -> PDF points)
         sx = page.rect.width / (di_p.width or 1.0)
         sy = page.rect.height / (di_p.height or 1.0)
 
-        # bbox center in DI units → PDF points
         bb = b["bbox"]
-        cx_di = (bb["x0"] + bb["x1"]) / 2.0
-        cy_di = (bb["y0"] + bb["y1"]) / 2.0
-        w_di  = max(1e-3, (bb["x1"] - bb["x0"]))
-        h_di  = max(1e-3, (bb["y1"] - bb["y0"]))
-        # circle radius = half of larger side, scaled, with a minimum visual size
-        r_pts = max((w_di * sx), (h_di * sy)) * 0.55
-        r_pts = max(r_pts, 6)  # min radius in points so it’s visible
+        x0_di, y0_di, x1_di, y1_di = bb["x0"], bb["y0"], bb["x1"], bb["y1"]
+        w_di  = max(1e-3, x1_di - x0_di)
+        h_di  = max(1e-3, y1_di - y0_di)
+
+        # Outline rectangle (optional)
+        if draw_outline:
+            rect_pts = fitz.Rect(x0_di * sx, y0_di * sy, x1_di * sx, y1_di * sy)
+            page.draw_rect(rect_pts, color=(1, 0, 0), width=0.8)
+
+        # Small circle at the top-left boundary (inside the blank)
+        # Center slightly inside the blank to avoid clipping on the edge
+        inset = 0.12  # 12% inward from top-left
+        cx_di = x0_di + inset * w_di
+        cy_di = y0_di + inset * h_di
+
+        # Circle radius: small fraction of the smaller dimension
+        base = min(w_di, h_di)
+        r_pts = max(3.5, min(12.0, base * min(sx, sy) * circle_scale))
 
         cx_pts = cx_di * sx
         cy_pts = cy_di * sy
 
-        # draw a red circle (stroke only)
         shape = page.new_shape()
         shape.draw_circle(fitz.Point(cx_pts, cy_pts), r_pts)
-        shape.finish(color=(1, 0, 0), fill=None, width=1.5)  # red outline
+        shape.finish(color=(1, 0, 0), fill=None, width=1.3)  # red outline
         shape.commit()
+
+        # Put number inside the circle (1,2,3,...)
+        # Use a small font that fits the circle
+        num_text = str(idx)
+        font_size = max(4.0, min(9.0, r_pts * 1.1))
+        # A tiny textbox centered on the circle
+        box = fitz.Rect(cx_pts - r_pts*0.9, cy_pts - r_pts*0.9, cx_pts + r_pts*0.9, cy_pts + r_pts*0.9)
+        page.insert_textbox(box, num_text, fontsize=font_size, fontname="helv", align=1, color=(1, 0, 0))
+
+        # Optional: 'Blank N' label just inside the rectangle boundary
+        if label_in_rect and draw_outline:
+            label = f"Blank {idx}"
+            # place at top-left inside the blank, small font
+            label_box = fitz.Rect(x0_di * sx + 2, y0_di * sy + 2, (x0_di * sx) + 80, (y0_di * sy) + 18)
+            page.insert_textbox(label_box, label, fontsize=7, fontname="helv", color=(1, 0, 0), align=0)
 
     doc.save(output_pdf_path, deflate=True)
     doc.close()
@@ -299,14 +334,19 @@ def main():
     key = os.getenv("AZURE_DI_KEY")
     assert endpoint and key, "Set AZURE_DI_ENDPOINT and AZURE_DI_KEY in your environment or .env"
 
-    parser = argparse.ArgumentParser(description="Strict blank detector + overlay (Azure Document Intelligence)")
+    parser = argparse.ArgumentParser(description="Strict blank detector + small-circle overlay")
     src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--file", type=str, help="Local file path (PDF, TIFF, JPG, PNG, etc.)")
+    src.add_argument("--file", type=str, help="Local file path (PDF, etc.)")
     src.add_argument("--url", type=str, help="Public/SAS URL to the document")
     parser.add_argument("--include-label-gaps", action="store_true",
                         help="Also flag label→gap blanks (very conservative). OFF by default.")
     parser.add_argument("--debug", action="store_true", help="Print DI overview and per-page summary.")
     parser.add_argument("--overlay", type=str, help="Output PDF path to save circles overlay, e.g., out/annotated.pdf")
+    parser.add_argument("--circle-scale", type=float, default=0.04,
+                        help="Circle size as fraction of blank min dimension (default 0.04). Try 0.02–0.06.")
+    parser.add_argument("--outline", action="store_true", help="Draw a thin red rectangle around blank (boundary).")
+    parser.add_argument("--label-in-rect", action="store_true",
+                        help="Write 'Blank N' inside rectangle near boundary (requires --outline).")
     args = parser.parse_args()
 
     result = analyze_document(endpoint, key, file_path=args.file, url=args.url)
@@ -329,12 +369,19 @@ def main():
     # print JSON
     print(json.dumps({"blanks": blanks}, indent=2))
 
-    # overlay, if requested
+    # overlay (if requested)
     if args.overlay:
         if not args.file:
-            # overlay needs the local PDF path
-            raise ValueError("Overlay requires --file to draw on a local PDF.")
-        overlay_red_circles(args.file, args.overlay, blanks, result.pages or [])
+            raise ValueError("Overlay requires --file (local PDF) to draw on.")
+        overlay_marks(
+            input_pdf_path=args.file,
+            output_pdf_path=args.overlay,
+            blanks=blanks,
+            di_pages=(result.pages or []),
+            circle_scale=args.circle_scale,
+            draw_outline=args.outline,
+            label_in_rect=args.label_in_rect
+        )
         print(f"\nSaved overlay PDF → {args.overlay}")
 
     # debug summary
