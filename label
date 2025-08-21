@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+scan_gotoscreen.py
+
+Finds calls like:
+  ScreenDriver::Instance().GotoScreen(ScreenDriver::DialogBarcodeNotRecognized, 0);
+  ScreenDriver::Instance().goToScreen(ScreenDriver::Dialog::Info, 2);
+  ScreenDriver::Instance().GotoScreenImmediate(ScreenDriver::Setup, CONFIGURATION);
+
+Extracts:
+  - Screen token (e.g., "ScreenDriver::DialogBarcodeNotRecognized" or "ScreenDriver::Dialog::Info" or "ScreenDriver::Setup")
+  - Variation (number or identifier, e.g., 0/1/2 or CONFIGURATION/PRESCRIPTION/...)
+  - File, line, and the source line snippet
+
+It also *attempts* to resolve an integer "EnumValue" for the screen by scanning project files for:
+  - enum / enum class blocks
+  - #define NAME NUMBER
+  - const int NAME = NUMBER;
+
+If an enum/constant cannot be found, EnumValue is left blank.
+Outputs:
+  - Excel workbook with two sheets: "Raw" (every match) and "ByScreen" (unique Screen+Variation)
+  - Optional CSV if you pass --csv path
+"""
+
+import argparse
+import os
+import re
+from typing import Dict, Iterable, List, Optional, Tuple
+
+try:
+    import pandas as pd
+except Exception as e:
+    pd = None
+
+# ---------------
+# Regex patterns
+# ---------------
+
+# Matches function name (goToScreen / GotoScreen / GotoScreenImmediate), case-insensitive.
+# Captures Screen token after "ScreenDriver::" and the variation (either digits or an identifier).
+CALL_RE = re.compile(
+    r'''(?ix)                                  # i: case-insensitive, x: verbose
+    \bgo?toScreen(?:Immediate)?                # goToScreen / GotoScreen / GotoScreenImmediate
+    \s*\(\s*
+    ScreenDriver::
+    (?P<screen>
+        [A-Za-z_]\w*(?:::[A-Za-z_]\w*)?       # e.g. DialogBarcodeNotRecognized  OR Dialog::Info  OR Setup
+    )
+    \s*,\s*
+    (?P<variation>[A-Za-z_]\w*|\d+)            # 0 / 1 / 2  OR CONFIGURATION / PRESCRIPTION / ...
+    \s*\)
+    ''')
+
+# Enum parser (very forgiving): enum [class] Name { A = 10, B, C=13, ... };
+ENUM_BLOCK_RE = re.compile(
+    r'''(?sx)                                  # s: dot matches newlines
+    \benum(?:\s+class)?\s+
+    (?P<name>[A-Za-z_]\w*)\s*
+    \{\s*(?P<body>.*?)\s*\}\s*;
+    '''
+)
+
+# Enumerator lines within enum block: NAME [= NUMBER] [,]
+ENUM_ELEM_RE = re.compile(
+    r'''(?x)
+    (?P<id>[A-Za-z_]\w*)
+    (?:\s*=\s*(?P<val>[-+]?\d+))?
+    \s*,?
+    '''
+)
+
+# #define NAME NUMBER
+DEFINE_RE = re.compile(
+    r'''(?mx)                                  # m: multi-line
+    ^\s* \#\s*define \s+ (?P<name>[A-Za-z_]\w+) \s+ (?P<val>[-+]?\d+)\b
+    '''
+)
+
+# const int NAME = NUMBER;
+CONST_INT_RE = re.compile(
+    r'''(?mx)
+    ^\s* const \s+ (?:int|unsigned\s+int|long|unsigned\s+long|auto) \s+
+    (?P<name>[A-Za-z_]\w+) \s* = \s* (?P<val>[-+]?\d+) \s* ;
+    '''
+)
+
+
+def iter_source_files(root: str) -> Iterable[str]:
+    exts = {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".h", ".hxx", ".inl"}
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if os.path.splitext(fn)[1].lower() in exts:
+                yield os.path.join(dirpath, fn)
+
+
+def read_text(path: str) -> str:
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            with open(path, "r", encoding=enc, errors="ignore") as f:
+                return f.read()
+        except Exception:
+            continue
+    # fallback
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "ignore")
+
+
+def find_calls_in_file(path: str) -> List[dict]:
+    text = read_text(path)
+    lines = text.splitlines()
+    out: List[dict] = []
+    for m in CALL_RE.finditer(text):
+        start = m.start()
+        # Line number (1-based)
+        line_no = text.count("\n", 0, start) + 1
+        line_text = lines[line_no - 1].strip() if 0 <= line_no - 1 < len(lines) else ""
+        out.append({
+            "File": os.path.relpath(path),
+            "Line": line_no,
+            "Screen": f"ScreenDriver::{{m.group('screen')}}",
+            "Variation": m.group("variation"),
+            "Call": m.group(0).strip(),
+            "CodeLine": line_text,
+        })
+    return out
+
+
+def build_symbol_map(root: str) -> Dict[str, int]:
+    """
+    Build a best-effort map of NAME -> integer by scanning enums, #defines, and const ints.
+    Only used to fill the 'EnumValue' column when the name matches.
+    """
+    sym: Dict[str, int] = {}
+    for path in iter_source_files(root):
+        try:
+            text = read_text(path)
+        except Exception:
+            continue
+
+        # #define NAME NUMBER
+        for d in DEFINE_RE.finditer(text):
+            name = d.group("name")
+            val = int(d.group("val"))
+            sym[name] = val
+
+        # const int NAME = NUMBER;
+        for c in CONST_INT_RE.finditer(text):
+            sym[c.group("name")] = int(c.group("val"))
+
+        # enum blocks
+        for m in ENUM_BLOCK_RE.finditer(text):
+            body = m.group("body")
+            cur = -1
+            for e in ENUM_ELEM_RE.finditer(body):
+                name = e.group("id")
+                v = e.group("val")
+                if v is not None:
+                    cur = int(v)
+                else:
+                    cur += 1
+                sym[name] = cur
+    return sym
+
+
+def try_resolve_enum(screen_token: str, symmap: Dict[str, int]) -> Optional[int]:
+    """
+    screen_token looks like:
+      "ScreenDriver::DialogBarcodeNotRecognized"  -> try "DialogBarcodeNotRecognized"
+      "ScreenDriver::Dialog::Info"                -> try "Info" and "Dialog::Info" (unlikely in enums)
+      "ScreenDriver::Setup"                       -> try "Setup"
+    """
+    # drop "ScreenDriver::"
+    raw = screen_token.split("ScreenDriver::", 1)[-1]
+    candidates = [raw]
+
+    # If it has ::, try last part too
+    if "::" in raw:
+        candidates.append(raw.split("::")[-1])
+
+    for key in candidates:
+        if key in symmap:
+            return symmap[key]
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Scan C++ for goToScreen/GotoScreen calls and export to Excel/CSV.")
+    ap.add_argument("root", nargs="?", default=".", help="Project root folder (default: current directory)")
+    ap.add_argument("--xlsx", default="screens.xlsx", help="Output Excel file (default: screens.xlsx)")
+    ap.add_argument("--csv", default=None, help="Optional CSV file path")
+    ap.add_argument("--no-enum", action="store_true", help="Skip trying to resolve enum/const values")
+    args = ap.parse_args()
+
+    rows: List[dict] = []
+    for path in iter_source_files(args.root):
+        try:
+            rows.extend(find_calls_in_file(path))
+        except Exception as e:
+            # ignore unreadable files
+            continue
+
+    if not rows:
+        print("No goToScreen/GotoScreen calls found.")
+        return
+
+    # Try to resolve enum values
+    symmap: Dict[str, int] = {}
+    if not args.no_enum:
+        try:
+            symmap = build_symbol_map(args.root)
+        except Exception:
+            symmap = {}
+
+    # enrich rows
+    for r in rows:
+        enum_val = try_resolve_enum(r["Screen"], symmap) if symmap else None
+        r["EnumValue"] = enum_val
+
+    # Sort
+    rows.sort(key=lambda r: (r["Screen"].lower(), str(r["Variation"]).lower(), r["File"].lower(), r["Line"]))
+
+    # Prepare dataframes
+    try:
+        import pandas as pd  # local import in case unavailable
+        df = pd.DataFrame(rows, columns=["Screen", "EnumValue", "Variation", "File", "Line", "CodeLine"])
+
+        # Summary: unique Screen+Variation with count and first location
+        summary_cols = ["Screen", "EnumValue", "Variation"]
+        df_summary = (
+            df.groupby(summary_cols, dropna=False)
+              .agg(Count=("Screen", "size"),
+                   FirstFile=("File", "first"),
+                   FirstLine=("Line", "first"))
+              .reset_index()
+              .sort_values(["Screen", "Variation"], kind="stable")
+        )
+
+        # Write Excel
+        with pd.ExcelWriter(args.xlsx, engine="openpyxl") as xw:
+            df.to_excel(xw, index=False, sheet_name="Raw")
+            df_summary.to_excel(xw, index=False, sheet_name="ByScreen")
+
+        print(f"Wrote Excel: {args.xlsx}  (sheets: Raw, ByScreen)")
+        if args.csv:
+            df_summary.to_csv(args.csv, index=False)
+            print(f"Wrote CSV summary: {args.csv}")
+    except Exception as e:
+        # Fallback without pandas: write a simple CSV
+        import csv
+        out_csv = args.csv or (os.path.splitext(args.xlsx)[0] + ".csv")
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Screen", "EnumValue", "Variation", "File", "Line", "CodeLine"])
+            for r in rows:
+                w.writerow([r["Screen"], r["EnumValue"] if r["EnumValue"] is not None else "",
+                            r["Variation"], r["File"], r["Line"], r["CodeLine"]])
+        print("Pandas not available; wrote CSV instead:", out_csv)
+
+
+if __name__ == "__main__":
+    main()
