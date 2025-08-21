@@ -1,6 +1,6 @@
-# detect_blanks.py — strict blank detector for Azure Document Intelligence (Document Intelligence / Form Recognizer)
+# detect_blanks.py — strict blank detector + red-circle overlay
 # Python 3.9+
-# pip install azure-ai-formrecognizer>=3.2 azure-core python-dotenv
+# pip install azure-ai-formrecognizer>=3.2 azure-core python-dotenv pymupdf
 
 import os
 import re
@@ -10,6 +10,8 @@ from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
+
+import fitz  # PyMuPDF
 
 # -----------------------
 # Regex / helpers
@@ -28,7 +30,6 @@ def is_placeholder_or_empty(s: Optional[str]) -> bool:
     return (not s) or bool(PLACEHOLDER_RE.match(s))
 
 def poly_to_bbox(poly) -> Tuple[float, float, float, float]:
-    # guard for weird polygons
     xs = [p.x for p in poly] if poly else []
     ys = [p.y for p in poly] if poly else []
     if not xs or not ys:
@@ -48,7 +49,6 @@ def rect_overlap(a, b) -> float:
     return iw * ih
 
 def has_real_words(words, rect, margin=0.0) -> bool:
-    """True if any non-placeholder word overlaps the rect (with optional padding)."""
     x0, y0, x1, y1 = rect
     padded = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
     for w in words or []:
@@ -77,13 +77,11 @@ def debug_overview(result):
         print(f"  Page {p.page_number}: words={len(p.words or [])}, lines={len(p.lines or [])}, marks={len(p.selection_marks or [])}, size=({p.width}x{p.height})")
 
 # -----------------------
-# Detectors
+# Detectors (strict)
 # -----------------------
 def detect_table_blanks(result, words_by_page, skipped) -> List[Dict[str, Any]]:
-    """Flag only when (a) cell has geometry, (b) cell text is empty/placeholder, and (c) there are NO words in that cell box."""
     out = []
     for t_idx, t in enumerate(result.tables or []):
-        # headers: explicit kind wins; else first non-empty row
         col_headers: Dict[int, str] = {}
         header_rows = set()
         for c in t.cells:
@@ -111,11 +109,9 @@ def detect_table_blanks(result, words_by_page, skipped) -> List[Dict[str, Any]]:
             reg = c.bounding_regions[0]
             page_no = reg.page_number
             cell_rect = poly_to_bbox(reg.polygon)
-            # strict: must be geometrically empty of words
             if has_real_words(words_by_page.get(page_no), cell_rect):
                 skipped["table_words_present"] += 1
                 continue
-            # strict: text must be empty/placeholder too
             if is_placeholder_or_empty(norm(c.content)):
                 col_lbl = col_headers.get(c.column_index, f"Col {c.column_index+1}")
                 row_lbl = None
@@ -134,12 +130,6 @@ def detect_table_blanks(result, words_by_page, skipped) -> List[Dict[str, Any]]:
     return out
 
 def detect_kv_blanks(result, pages_by_no, words_by_page, skipped) -> List[Dict[str, Any]]:
-    """
-    Strict KV: only flag if
-      - value text is empty/placeholder OR low confidence,
-      - AND there are NO real words inside the value box,
-      - AND there are NO real words immediately to the right of the key (same line height).
-    """
     out = []
     for kv in (result.key_value_pairs or []):
         key_txt = norm(getattr(kv.key, "content", "") if kv.key else "")
@@ -147,7 +137,6 @@ def detect_kv_blanks(result, pages_by_no, words_by_page, skipped) -> List[Dict[s
         val_txt  = norm(getattr(val, "content", "") if val else "")
         val_conf = getattr(val, "confidence", 0.0) if val else 0.0
 
-        # primary region: prefer value region; else key region as proxy
         region = None
         if val and getattr(val, "bounding_regions", None):
             region = val.bounding_regions[0]
@@ -160,13 +149,11 @@ def detect_kv_blanks(result, pages_by_no, words_by_page, skipped) -> List[Dict[s
         page = pages_by_no.get(page_no)
         page_w = page.width if page else 1000.0
 
-        # 1) check value box itself (if value has a bbox)
         value_has_words = False
         if val and getattr(val, "bounding_regions", None):
             vrect = poly_to_bbox(val.bounding_regions[0].polygon)
             value_has_words = has_real_words(words_by_page.get(page_no), vrect)
 
-        # 2) check immediate right of key (captures cases like "Document #: F2000")
         if kv.key and getattr(kv.key, "bounding_regions", None):
             kx0, ky0, kx1, ky1 = poly_to_bbox(kv.key.bounding_regions[0].polygon)
             line_h = max(8.0, (ky1 - ky0))
@@ -205,13 +192,6 @@ def detect_selection_mark_blanks(result) -> List[Dict[str, Any]]:
     return out
 
 def detect_label_gap_blanks(result, words_by_page, enable=False) -> List[Dict[str, Any]]:
-    """
-    VERY conservative: only if
-      - line ends with ':'
-      - big right-side gap with no words
-      - AND no words directly below that gap (wrapped value on next line)
-    Default: disabled for strictness.
-    """
     if not enable:
         return []
     out = []
@@ -227,15 +207,10 @@ def detect_label_gap_blanks(result, words_by_page, enable=False) -> List[Dict[st
             line_w = max(lx1 - lx0, 1.0)
             avg_char_w = line_w / max(len(text), 10)
             min_gap = min_gap_threshold(avg_char_w, page_w)
-
-            # Right 35% of line as candidate gap
             gap = (lx0 + 0.65*line_w, ly0, lx1, ly1)
             gap_w = max(0.0, gap[2]-gap[0])
-
-            # 1) words in gap? -> not blank
             if has_real_words(words, gap):
                 continue
-            # 2) words directly below gap (wrap to next line)? -> not blank
             below = grow(gap, up=0, down=(ly1-ly0)*0.9)
             if has_real_words(words, below):
                 continue
@@ -243,12 +218,63 @@ def detect_label_gap_blanks(result, words_by_page, enable=False) -> List[Dict[st
                 out.append({
                     "page": page_no,
                     "bbox": bbox_to_dict(gap),
-                    "label": text[:-1],  # strip ':'
+                    "label": text[:-1],
                     "source": "label_gap",
                     "reason": "label_right_gap",
                     "confidence": 0.65
                 })
     return out
+
+# -----------------------
+# Overlay (red circles)
+# -----------------------
+def overlay_red_circles(input_pdf_path: str, output_pdf_path: str, blanks: List[Dict[str, Any]], di_pages: Dict[int, Any]):
+    """
+    Draw a red circle at each blank's center.
+    Coordinate mapping:
+      - Azure DI gives (x,y) in DI page units; DI provides page.width/page.height.
+      - PyMuPDF page.rect is in points; we scale per page: sx = page.rect.width / di_page.width, sy = page.rect.height / di_page.height.
+    """
+    os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+    doc = fitz.open(input_pdf_path)
+
+    # index DI pages by number for width/height
+    di_page_map = {p.page_number: p for p in di_pages}
+
+    for b in blanks:
+        pno = b["page"]  # 1-based
+        if pno < 1 or pno > len(doc):
+            continue
+        page = doc[pno - 1]
+        di_p = di_page_map.get(pno)
+        if not di_p:
+            continue
+
+        # scales
+        sx = page.rect.width / (di_p.width or 1.0)
+        sy = page.rect.height / (di_p.height or 1.0)
+
+        # bbox center in DI units → PDF points
+        bb = b["bbox"]
+        cx_di = (bb["x0"] + bb["x1"]) / 2.0
+        cy_di = (bb["y0"] + bb["y1"]) / 2.0
+        w_di  = max(1e-3, (bb["x1"] - bb["x0"]))
+        h_di  = max(1e-3, (bb["y1"] - bb["y0"]))
+        # circle radius = half of larger side, scaled, with a minimum visual size
+        r_pts = max((w_di * sx), (h_di * sy)) * 0.55
+        r_pts = max(r_pts, 6)  # min radius in points so it’s visible
+
+        cx_pts = cx_di * sx
+        cy_pts = cy_di * sy
+
+        # draw a red circle (stroke only)
+        shape = page.new_shape()
+        shape.draw_circle(fitz.Point(cx_pts, cy_pts), r_pts)
+        shape.finish(color=(1, 0, 0), fill=None, width=1.5)  # red outline
+        shape.commit()
+
+    doc.save(output_pdf_path, deflate=True)
+    doc.close()
 
 # -----------------------
 # Runner
@@ -273,22 +299,21 @@ def main():
     key = os.getenv("AZURE_DI_KEY")
     assert endpoint and key, "Set AZURE_DI_ENDPOINT and AZURE_DI_KEY in your environment or .env"
 
-    parser = argparse.ArgumentParser(description="Strict blank detector (Azure Document Intelligence)")
+    parser = argparse.ArgumentParser(description="Strict blank detector + overlay (Azure Document Intelligence)")
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", type=str, help="Local file path (PDF, TIFF, JPG, PNG, etc.)")
     src.add_argument("--url", type=str, help="Public/SAS URL to the document")
     parser.add_argument("--include-label-gaps", action="store_true",
                         help="Also flag label→gap blanks (very conservative). OFF by default.")
     parser.add_argument("--debug", action="store_true", help="Print DI overview and per-page summary.")
+    parser.add_argument("--overlay", type=str, help="Output PDF path to save circles overlay, e.g., out/annotated.pdf")
     args = parser.parse_args()
 
     result = analyze_document(endpoint, key, file_path=args.file, url=args.url)
-
     if args.debug:
         debug_overview(result)
 
     pages_by_no, words_by_page = build_page_indexes(result)
-
     skipped = {"table_words_present": 0, "kv_value_present": 0}
 
     blanks: List[Dict[str, Any]] = []
@@ -297,12 +322,22 @@ def main():
     blanks += detect_selection_mark_blanks(result)
     blanks += detect_label_gap_blanks(result, words_by_page, enable=args.include_label_gaps)
 
-    # Sort by page, then source priority
+    # sort results
     priority = {"table": 0, "selection_mark": 1, "key_value": 2, "label_gap": 3}
     blanks.sort(key=lambda b: (b["page"], priority.get(b["source"], 99), -b.get("confidence", 0.0)))
 
+    # print JSON
     print(json.dumps({"blanks": blanks}, indent=2))
 
+    # overlay, if requested
+    if args.overlay:
+        if not args.file:
+            # overlay needs the local PDF path
+            raise ValueError("Overlay requires --file to draw on a local PDF.")
+        overlay_red_circles(args.file, args.overlay, blanks, result.pages or [])
+        print(f"\nSaved overlay PDF → {args.overlay}")
+
+    # debug summary
     if args.debug:
         per_page = {}
         for b in blanks:
