@@ -1,12 +1,13 @@
-# detect_blanks.py — strict blank detector + small-circle overlay & labels
+# detect_blanks.py — strict blank detector + text overlay ("Blank 1", "Blank 2", ...)
 # Python 3.9+
-# pip install azure-ai-formrecognizer>=3.2 azure-core python-dotenv pymupdf
+# pip install azure-ai-formrecognizer python-dotenv pymupdf
 
 import os
 import re
 import json
 import argparse
 from typing import List, Dict, Any, Tuple, Optional
+
 from dotenv import load_dotenv
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
@@ -48,6 +49,7 @@ def rect_overlap(a, b) -> float:
     return iw * ih
 
 def has_real_words(words, rect, margin=0.0) -> bool:
+    """True if any non-placeholder word overlaps the rect (with optional padding)."""
     x0, y0, x1, y1 = rect
     padded = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
     for w in words or []:
@@ -66,6 +68,24 @@ def grow(rect, left=0, up=0, right=0, down=0):
 def min_gap_threshold(avg_char_w: float, page_w: float) -> float:
     return max(1.5 * max(avg_char_w, 1.0), 0.05 * page_w)
 
+def _parse_color(s: str):
+    """Accept named colors or 'r,g,b' in 0..1; defaults to red."""
+    NAMED = {
+        "red": (1, 0, 0), "white": (1, 1, 1), "black": (0, 0, 0),
+        "blue": (0, 0, 1), "green": (0, 1, 0), "yellow": (1, 1, 0),
+        "magenta": (1, 0, 1), "cyan": (0, 1, 1), "gray": (0.5, 0.5, 0.5)
+    }
+    s = (s or "").strip().lower()
+    if s in NAMED:
+        return NAMED[s]
+    try:
+        parts = [float(x) for x in s.split(",")]
+        if len(parts) == 3 and all(0.0 <= p <= 1.0 for p in parts):
+            return tuple(parts)
+    except Exception:
+        pass
+    return NAMED["red"]
+
 # -----------------------
 # Debug (optional)
 # -----------------------
@@ -79,6 +99,7 @@ def debug_overview(result):
 # Detectors (strict)
 # -----------------------
 def detect_table_blanks(result, words_by_page, skipped) -> List[Dict[str, Any]]:
+    """Flag only when (a) cell has geometry, (b) cell text is empty/placeholder, and (c) there are NO words in that cell box."""
     out = []
     for t_idx, t in enumerate(result.tables or []):
         col_headers: Dict[int, str] = {}
@@ -108,9 +129,11 @@ def detect_table_blanks(result, words_by_page, skipped) -> List[Dict[str, Any]]:
             reg = c.bounding_regions[0]
             page_no = reg.page_number
             cell_rect = poly_to_bbox(reg.polygon)
+            # must be geometrically empty of words
             if has_real_words(words_by_page.get(page_no), cell_rect):
                 skipped["table_words_present"] += 1
                 continue
+            # and text must be empty/placeholder
             if is_placeholder_or_empty(norm(c.content)):
                 col_lbl = col_headers.get(c.column_index, f"Col {c.column_index+1}")
                 row_lbl = None
@@ -129,6 +152,12 @@ def detect_table_blanks(result, words_by_page, skipped) -> List[Dict[str, Any]]:
     return out
 
 def detect_kv_blanks(result, pages_by_no, words_by_page, skipped) -> List[Dict[str, Any]]:
+    """
+    Strict KV: only flag if
+      - value text is empty/placeholder OR low confidence,
+      - AND there are NO real words inside the value box,
+      - AND there are NO real words immediately to the right of the key (same line height).
+    """
     out = []
     for kv in (result.key_value_pairs or []):
         key_txt = norm(getattr(kv.key, "content", "") if kv.key else "")
@@ -191,6 +220,9 @@ def detect_selection_mark_blanks(result) -> List[Dict[str, Any]]:
     return out
 
 def detect_label_gap_blanks(result, words_by_page, enable=False) -> List[Dict[str, Any]]:
+    """
+    VERY conservative label→gap detection. OFF by default to keep things strict.
+    """
     if not enable:
         return []
     out = []
@@ -225,32 +257,29 @@ def detect_label_gap_blanks(result, words_by_page, enable=False) -> List[Dict[st
     return out
 
 # -----------------------
-# Overlay (small circles + optional rectangle + labels)
+# Overlay (replace blanks with labels)
 # -----------------------
-def overlay_marks(input_pdf_path: str,
-                  output_pdf_path: str,
-                  blanks: List[Dict[str, Any]],
-                  di_pages: List[Any],
-                  circle_scale: float = 0.04,
-                  draw_outline: bool = False,
-                  label_in_rect: bool = False):
+def overlay_labels(input_pdf_path: str,
+                   output_pdf_path: str,
+                   blanks: List[Dict[str, Any]],
+                   di_pages: List[Any],
+                   label_prefix: str = "Blank",
+                   text_color_str: str = "red",
+                   font_size: Optional[float] = None,
+                   draw_outline: bool = False):
     """
-    Draw a small red circle at the top-left boundary inside each blank.
-    - circle_scale: fraction of min(blank_width, blank_height) to set radius (clamped).
-    - draw_outline: draw a thin rectangle around the blank area.
-    - label_in_rect: write 'Blank N' very small near the top-left inside the rectangle.
+    Replace each detected blank area with a centered label: 'Blank 1', 'Blank 2', ...
+    - font_size: if None, auto-scale to ~40% of the blank height (min 6, max 16).
+    - draw_outline: faint rectangle boundary to show the original blank extents.
     """
-    if not blanks:
-        # still create a copy so user gets a file
-        doc = fitz.open(input_pdf_path)
-        os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
-        doc.save(output_pdf_path, deflate=True)
-        doc.close()
-        return
-
-    os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+    # If no blanks, still save a copy so caller gets an output file.
+    os.makedirs(os.path.dirname(output_pdf_path) or ".", exist_ok=True)
     doc = fitz.open(input_pdf_path)
+    if not blanks:
+        doc.save(output_pdf_path, deflate=True); doc.close(); return
+
     di_page_map = {p.page_number: p for p in di_pages}
+    text_color = _parse_color(text_color_str)
 
     for idx, b in enumerate(blanks, start=1):
         pno = b["page"]  # 1-based
@@ -261,52 +290,34 @@ def overlay_marks(input_pdf_path: str,
         if not di_p:
             continue
 
-        # scales (DI units -> PDF points)
+        # Scale from DI units to PDF points
         sx = page.rect.width / (di_p.width or 1.0)
         sy = page.rect.height / (di_p.height or 1.0)
 
         bb = b["bbox"]
-        x0_di, y0_di, x1_di, y1_di = bb["x0"], bb["y0"], bb["x1"], bb["y1"]
-        w_di  = max(1e-3, x1_di - x0_di)
-        h_di  = max(1e-3, y1_di - y0_di)
+        rect_pts = fitz.Rect(bb["x0"]*sx, bb["y0"]*sy, bb["x1"]*sx, bb["y1"]*sy)
 
-        # Outline rectangle (optional)
+        # Optional boundary to visualize the blank extents
         if draw_outline:
-            rect_pts = fitz.Rect(x0_di * sx, y0_di * sy, x1_di * sx, y1_di * sy)
-            page.draw_rect(rect_pts, color=(1, 0, 0), width=0.8)
+            page.draw_rect(rect_pts, color=(0.7, 0.7, 0.7), width=0.5)
 
-        # Small circle at the top-left boundary (inside the blank)
-        # Center slightly inside the blank to avoid clipping on the edge
-        inset = 0.12  # 12% inward from top-left
-        cx_di = x0_di + inset * w_di
-        cy_di = y0_di + inset * h_di
+        # Build the label and pick a font size
+        label = f"{label_prefix} {idx}".strip()
+        if font_size is None:
+            # Auto-size: ~40% of rect height, clamped
+            fs = max(6.0, min(16.0, rect_pts.height * 0.40))
+        else:
+            fs = float(font_size)
 
-        # Circle radius: small fraction of the smaller dimension
-        base = min(w_di, h_di)
-        r_pts = max(3.5, min(12.0, base * min(sx, sy) * circle_scale))
-
-        cx_pts = cx_di * sx
-        cy_pts = cy_di * sy
-
-        shape = page.new_shape()
-        shape.draw_circle(fitz.Point(cx_pts, cy_pts), r_pts)
-        shape.finish(color=(1, 0, 0), fill=None, width=1.3)  # red outline
-        shape.commit()
-
-        # Put number inside the circle (1,2,3,...)
-        # Use a small font that fits the circle
-        num_text = str(idx)
-        font_size = max(4.0, min(9.0, r_pts * 1.1))
-        # A tiny textbox centered on the circle
-        box = fitz.Rect(cx_pts - r_pts*0.9, cy_pts - r_pts*0.9, cx_pts + r_pts*0.9, cy_pts + r_pts*0.9)
-        page.insert_textbox(box, num_text, fontsize=font_size, fontname="helv", align=1, color=(1, 0, 0))
-
-        # Optional: 'Blank N' label just inside the rectangle boundary
-        if label_in_rect and draw_outline:
-            label = f"Blank {idx}"
-            # place at top-left inside the blank, small font
-            label_box = fitz.Rect(x0_di * sx + 2, y0_di * sy + 2, (x0_di * sx) + 80, (y0_di * sy) + 18)
-            page.insert_textbox(label_box, label, fontsize=7, fontname="helv", color=(1, 0, 0), align=0)
+        # Center the label inside the blank
+        page.insert_textbox(
+            rect_pts,
+            label,
+            fontsize=fs,
+            fontname="helv",
+            align=1,          # centered
+            color=text_color
+        )
 
     doc.save(output_pdf_path, deflate=True)
     doc.close()
@@ -334,19 +345,19 @@ def main():
     key = os.getenv("AZURE_DI_KEY")
     assert endpoint and key, "Set AZURE_DI_ENDPOINT and AZURE_DI_KEY in your environment or .env"
 
-    parser = argparse.ArgumentParser(description="Strict blank detector + small-circle overlay")
+    parser = argparse.ArgumentParser(description="Strict blank detector + text overlay")
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--file", type=str, help="Local file path (PDF, etc.)")
     src.add_argument("--url", type=str, help="Public/SAS URL to the document")
     parser.add_argument("--include-label-gaps", action="store_true",
                         help="Also flag label→gap blanks (very conservative). OFF by default.")
     parser.add_argument("--debug", action="store_true", help="Print DI overview and per-page summary.")
-    parser.add_argument("--overlay", type=str, help="Output PDF path to save circles overlay, e.g., out/annotated.pdf")
-    parser.add_argument("--circle-scale", type=float, default=0.04,
-                        help="Circle size as fraction of blank min dimension (default 0.04). Try 0.02–0.06.")
-    parser.add_argument("--outline", action="store_true", help="Draw a thin red rectangle around blank (boundary).")
-    parser.add_argument("--label-in-rect", action="store_true",
-                        help="Write 'Blank N' inside rectangle near boundary (requires --outline).")
+    # Overlay options
+    parser.add_argument("--overlay", type=str, help="Output PDF path to write labels into blanks (e.g., out/annotated.pdf)")
+    parser.add_argument("--label-prefix", type=str, default="Blank", help="Prefix text for each blank label (default: 'Blank').")
+    parser.add_argument("--text-color", type=str, default="red", help="Label color name or 'r,g,b' in 0..1 (default: red).")
+    parser.add_argument("--font-size", type=float, default=None, help="Explicit font size; if omitted, auto-scales to blank height.")
+    parser.add_argument("--draw-outline", action="store_true", help="Draw faint rectangle boundary around each blank.")
     args = parser.parse_args()
 
     result = analyze_document(endpoint, key, file_path=args.file, url=args.url)
@@ -362,29 +373,30 @@ def main():
     blanks += detect_selection_mark_blanks(result)
     blanks += detect_label_gap_blanks(result, words_by_page, enable=args.include_label_gaps)
 
-    # sort results
+    # Sort results (page → source priority → confidence)
     priority = {"table": 0, "selection_mark": 1, "key_value": 2, "label_gap": 3}
     blanks.sort(key=lambda b: (b["page"], priority.get(b["source"], 99), -b.get("confidence", 0.0)))
 
-    # print JSON
+    # Always print JSON (useful for debugging / later filling)
     print(json.dumps({"blanks": blanks}, indent=2))
 
-    # overlay (if requested)
+    # Write overlay if requested
     if args.overlay:
         if not args.file:
-            raise ValueError("Overlay requires --file (local PDF) to draw on.")
-        overlay_marks(
+            raise ValueError("Overlay requires --file (local PDF).")
+        overlay_labels(
             input_pdf_path=args.file,
             output_pdf_path=args.overlay,
             blanks=blanks,
             di_pages=(result.pages or []),
-            circle_scale=args.circle_scale,
-            draw_outline=args.outline,
-            label_in_rect=args.label_in_rect
+            label_prefix=args.label_prefix,
+            text_color_str=args.text_color,
+            font_size=args.font_size,
+            draw_outline=args.draw_outline
         )
         print(f"\nSaved overlay PDF → {args.overlay}")
 
-    # debug summary
+    # Debug summary
     if args.debug:
         per_page = {}
         for b in blanks:
