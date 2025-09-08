@@ -1,0 +1,157 @@
+<script setup lang="ts">
+import { onUnmounted, ref, watch, nextTick } from 'vue'
+
+const props = defineProps<{
+  fileParam: string
+}>()
+
+const containerRef = ref<HTMLDivElement | null>(null)
+let viewerInstance: any = null
+let editorInstance: any = null
+let docAuthSystem: any = null
+
+function getFileExtension(url: string): string {
+  return url.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
+}
+
+async function loadDocument(path: string) {
+  console.log('Loading document:', path)
+  const extension = getFileExtension(path)
+  const container = containerRef.value
+  if (!container) {
+    console.error('Editor container not found!')
+    return
+  }
+
+  if (extension === 'pdf') {
+    const NutrientViewer = (await import('@nutrient-sdk/viewer')).default
+    viewerInstance = NutrientViewer.load({
+      container,
+      document: path,
+      baseUrl: `${window.location.protocol}//${window.location.host}/`,
+      enableEditing: true,
+      features: {
+        toolbar: true,
+        annotations: true,
+        edit: true
+      },
+      toolbarOptions: {
+        defaultTools: ['select', 'pen', 'highlight', 'erase', 'text', 'rectangle']
+      }
+    })
+
+    // Wait for PDF to load, then search & highlight "Author"
+    viewerInstance.on('documentLoaded', () => {
+      searchAndHighlight('Author')
+    })
+
+  } else if (extension === 'docx') {
+    const DocAuth = (await import('@nutrient-sdk/document-authoring')).default
+    docAuthSystem = await DocAuth.createDocAuthSystem()
+
+    try {
+      const response = await fetch(path, { cache: 'no-store' })
+      if (!response.ok) {
+        console.error(`Failed to fetch document: ${response.statusText}`)
+        return
+      }
+      const docxBlob = await response.blob()
+      const doc = await docAuthSystem.importDOCX(docxBlob)
+
+      editorInstance = await docAuthSystem.createEditor(container, {
+        document: doc,
+        enableEditing: true,
+        features: {
+          toolbar: true,
+          annotations: true,
+          edit: true,
+          structure: true
+        },
+        toolbarOptions: {
+          defaultTools: ['select', 'text', 'highlight', 'rectangle', 'structure']
+        }
+      })
+
+      // Wait a bit to ensure DOCX renders before searching
+      setTimeout(() => {
+        searchAndHighlight('Author')
+      }, 8000)
+
+    } catch (error) {
+      console.error('Error loading DOCX:', error)
+    }
+  } else {
+    console.warn(`Unsupported file extension: .${extension}`)
+  }
+}
+
+// Function to search and highlight text
+function searchAndHighlight(term: string) {
+  if (!term) return
+
+  // PDF search
+  if (viewerInstance?.findText) {
+    viewerInstance.findText({
+      query: term,
+      highlightAll: true
+    })
+    console.log(`Highlighted "${term}" in PDF`)
+    return
+  }
+
+  // DOCX search
+  if (editorInstance?.findText) {
+    const matches = editorInstance.findText(term)
+    console.log(`Found "${term}" in DOCX`, matches)
+    matches.forEach(range => {
+      editorInstance.addHighlight(range, { color: 'yellow' })
+    })
+    console.log(`Highlighted "${term}" in DOCX`)
+  }
+}
+
+watch(
+  () => props.fileParam,
+  async (newPath) => {
+    if (!newPath) return
+
+    // Cleanup old instances
+    if (viewerInstance?.unload) viewerInstance.unload(containerRef.value)
+    if (editorInstance?.destroy) editorInstance.destroy()
+
+    await nextTick()
+    console.log('Doc path received (cache-busted):', newPath)
+    await loadDocument(newPath)
+  }
+)
+
+onUnmounted(() => {
+  if (viewerInstance?.unload) viewerInstance.unload(containerRef.value)
+  if (editorInstance?.destroy) editorInstance.destroy()
+})
+</script>
+
+<template>
+  <div v-if="!fileParam" class="placeholder">
+    Please select the template first.
+  </div>
+  <div v-else ref="containerRef" class="container" />
+</template>
+
+<style scoped>
+.container {
+  width: 100%;
+  height: calc(100vh - 64px);
+  position: relative;
+}
+
+.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100vh - 64px);
+  font-size: 18px;
+  color: #888;
+  font-style: italic;
+}
+</style>
