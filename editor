@@ -1,21 +1,53 @@
 <script setup lang="ts">
-import { onUnmounted, ref, watch, nextTick } from 'vue'
+import { onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
 
-const props = defineProps<{
-  fileParam: string
-}>()
+const props = defineProps<{ fileParam: string }>()
 
 const containerRef = ref<HTMLDivElement | null>(null)
 let viewerInstance: any = null
 let editorInstance: any = null
 let docAuthSystem: any = null
 
+// ---------- Scroll persistence ----------
+function getScrollKey(path: string | undefined) {
+  return `nutrient-scroll:${path ?? ''}`
+}
+function saveScroll() {
+  const el = containerRef.value
+  if (!el) return
+  const key = getScrollKey(props.fileParam)
+  sessionStorage.setItem(key, String(el.scrollTop))
+}
+function restoreScroll() {
+  const el = containerRef.value
+  if (!el) return
+  const key = getScrollKey(props.fileParam)
+  const saved = sessionStorage.getItem(key)
+  if (saved) {
+    // Defer to let Nutrient lay out pages first
+    requestAnimationFrame(() => {
+      el.scrollTop = parseInt(saved, 10) || 0
+    })
+  }
+}
+
+function attachScrollListener() {
+  const el = containerRef.value
+  if (!el) return
+  el.addEventListener('scroll', saveScroll, { passive: true })
+}
+function detachScrollListener() {
+  const el = containerRef.value
+  if (!el) return
+  el.removeEventListener('scroll', saveScroll)
+}
+// ---------------------------------------
+
 function getFileExtension(url: string): string {
   return url.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
 }
 
 async function loadDocument(path: string) {
-  console.log('Loading document:', path)
   const extension = getFileExtension(path)
   const container = containerRef.value
   if (!container) {
@@ -30,18 +62,13 @@ async function loadDocument(path: string) {
       document: path,
       baseUrl: `${window.location.protocol}//${window.location.host}/`,
       enableEditing: true,
-      features: {
-        toolbar: true,
-        annotations: true,
-        edit: true
-      },
-      toolbarOptions: {
-        defaultTools: ['select', 'pen', 'highlight', 'erase', 'text', 'rectangle']
-      }
+      features: { toolbar: true, annotations: true, edit: true },
+      toolbarOptions: { defaultTools: ['select', 'pen', 'highlight', 'erase', 'text', 'rectangle'] }
     })
 
-    // Wait for PDF to load, then search & highlight "Author"
+    // When PDF pages are laid out, restore scroll then (and every reload)
     viewerInstance.on('documentLoaded', () => {
+      restoreScroll()
       searchAndHighlight('Author')
     })
 
@@ -61,21 +88,15 @@ async function loadDocument(path: string) {
       editorInstance = await docAuthSystem.createEditor(container, {
         document: doc,
         enableEditing: true,
-        features: {
-          toolbar: true,
-          annotations: true,
-          edit: true,
-          structure: true
-        },
-        toolbarOptions: {
-          defaultTools: ['select', 'text', 'highlight', 'rectangle', 'structure']
-        }
+        features: { toolbar: true, annotations: true, edit: true, structure: true },
+        toolbarOptions: { defaultTools: ['select', 'text', 'highlight', 'rectangle', 'structure'] }
       })
 
-      // Wait a bit to ensure DOCX renders before searching
+      // Give the layout a tick, then restore scroll & search
       setTimeout(() => {
+        restoreScroll()
         searchAndHighlight('Author')
-      }, 8000)
+      }, 0)
 
     } catch (error) {
       console.error('Error loading DOCX:', error)
@@ -89,60 +110,58 @@ async function loadDocument(path: string) {
 function searchAndHighlight(term: string) {
   if (!term) return
 
-  // PDF search
   if (viewerInstance?.findText) {
-    viewerInstance.findText({
-      query: term,
-      highlightAll: true
-    })
-    console.log(`Highlighted "${term}" in PDF`)
+    viewerInstance.findText({ query: term, highlightAll: true })
     return
   }
 
-  // DOCX search
   if (editorInstance?.findText) {
     const matches = editorInstance.findText(term)
-    console.log(`Found "${term}" in DOCX`, matches)
-    matches.forEach(range => {
+    matches.forEach((range: any) => {
       editorInstance.addHighlight(range, { color: 'yellow' })
     })
-    console.log(`Highlighted "${term}" in DOCX`)
   }
 }
 
 watch(
   () => props.fileParam,
-  async (newPath) => {
+  async (newPath, oldPath) => {
     if (!newPath) return
+
+    // Save scroll for the old doc before teardown
+    if (oldPath) saveScroll()
 
     // Cleanup old instances
     if (viewerInstance?.unload) viewerInstance.unload(containerRef.value)
     if (editorInstance?.destroy) editorInstance.destroy()
+    viewerInstance = null
+    editorInstance = null
 
     await nextTick()
-    console.log('Doc path received (cache-busted):', newPath)
     await loadDocument(newPath)
   }
 )
 
+onMounted(() => {
+  attachScrollListener()
+  // If the first render already has a file, restore immediately (useful on hot reloads)
+  nextTick(() => restoreScroll())
+})
+
 onUnmounted(() => {
+  saveScroll()
+  detachScrollListener()
   if (viewerInstance?.unload) viewerInstance.unload(containerRef.value)
   if (editorInstance?.destroy) editorInstance.destroy()
 })
 </script>
-
-<template>
-  <div v-if="!fileParam" class="placeholder">
-    Please select the template first.
-  </div>
-  <div v-else ref="containerRef" class="container" />
-</template>
 
 <style scoped>
 .container {
   width: 100%;
   height: calc(100vh - 64px);
   position: relative;
+  overflow: auto; /* make this the scroll owner we control */
 }
 
 .placeholder {
