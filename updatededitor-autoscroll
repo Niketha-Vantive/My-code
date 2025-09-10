@@ -10,29 +10,27 @@ let docAuthSystem: any = null
 
 let scrollerEl: HTMLElement | null = null
 let mo: MutationObserver | null = null
+let ro: ResizeObserver | null = null
+let pollTimer: number | null = null
 
-// --------- helpers ----------
+// ---------- utils ----------
 const basePath = (p?: string) => (p || '').split('?')[0]
-const keyFor = (p?: string) => `nutrient-scroll:${basePath(p)}`
+const keyFor   = (p?: string) => `nutrient-scroll:${basePath(p)}`
+const getExt   = (u: string) => u.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
 
-function getExt(url: string) {
-  return url.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
-}
-
-// Inner scroller & pages (PDF.js)
 function findInnerScroller(root: HTMLElement): HTMLElement {
-  // hard-target PDF.js first
+  // PDF.js typical structure
   const pdfScroller = root.querySelector('.viewerContainer') as HTMLElement | null
   if (pdfScroller && pdfScroller.scrollHeight > pdfScroller.clientHeight) return pdfScroller
 
-  // general fallbacks (DOCX/editor cases)
+  // Other likely wrappers
   const candidates = ['.pdfViewer', '.np-pages', '.nutrient-viewer', '.editor-scroll']
   for (const sel of candidates) {
     const el = root.querySelector(sel) as HTMLElement | null
     if (el && el.scrollHeight > el.clientHeight + 4) return el
   }
 
-  // last resort: deepest scrollable
+  // Fallback: deepest scrollable node
   let best: HTMLElement = root
   const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
   let n: any
@@ -44,13 +42,11 @@ function findInnerScroller(root: HTMLElement): HTMLElement {
 }
 
 function getPages(scroller: HTMLElement) {
-  // PDF.js pages have class "page"
   return Array.from(scroller.querySelectorAll('.page,[data-page-number],[data-page-index]')) as HTMLElement[]
 }
 
 type ScrollState = { mode: 'page'|'raw'; pageIndex?: number; offsetPct?: number; scrollTop?: number }
 
-// Compute current page + within-page offset
 function computeScrollState(root: HTMLElement): ScrollState {
   const scroller = findInnerScroller(root)
   const pages = getPages(scroller)
@@ -96,8 +92,8 @@ function restoreScrollWhenReady() {
   const raw = sessionStorage.getItem(keyFor(props.fileParam))
   if (!raw) return
   const state = JSON.parse(raw) as ScrollState
-  const start = performance.now(), timeout = 7000
 
+  const start = performance.now(), timeout = 8000
   const tryApply = () => {
     if (applyScrollState(root, state)) return
     if (performance.now() - start > timeout) return
@@ -106,8 +102,8 @@ function restoreScrollWhenReady() {
   requestAnimationFrame(tryApply)
 }
 
-// Observe inner page rebuilds (happens after chatbot autofill)
-function attachMutationObserver() {
+// ---------- observers & hooks ----------
+function wireScrollSaving() {
   const root = containerRef.value; if (!root) return
   scrollerEl = findInnerScroller(root)
 
@@ -121,37 +117,55 @@ function attachMutationObserver() {
   })()
   scrollerEl.addEventListener('scroll', throttled, { passive: true })
 
-  // Signature of current page tree
-  const signature = () => {
-    const pages = getPages(scrollerEl!)
-    const first = pages[0]?.offsetHeight || 0
-    const last  = pages[pages.length - 1]?.offsetHeight || 0
-    return `${pages.length}:${first}:${last}`
-  }
-  let lastSig = signature()
-
+  // MutationObserver (child list changes)
   mo = new MutationObserver(() => {
-    const s = signature()
-    if (s !== lastSig) {
-      lastSig = s
-      // Inner DOM changed → likely rebuild after autofill
-      restoreScrollWhenReady()
-    }
+    // DOM changed → likely rebuild or canvases swapped
+    kickRestoreCycle()
   })
   mo.observe(scrollerEl, { childList: true, subtree: true })
+
+  // ResizeObserver (page canvas relaid out without DOM change)
+  ro = new ResizeObserver(() => {
+    // Layout changed → restore to previous page/offset
+    kickRestoreCycle()
+  })
+  // observe scroller & first page (covers most PDF.js repaints)
+  ro.observe(scrollerEl)
+  const firstPage = getPages(scrollerEl)[0]
+  if (firstPage) ro.observe(firstPage)
 }
 
-function detachMutationObserver() {
-  try { scrollerEl?.replaceWith(scrollerEl!) } catch {} // noop to drop listeners if needed
+// After any detected update, attempt several times to restore
+function kickRestoreCycle() {
+  // Quick multi-try (covers silent repaints)
+  let tries = 0
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+  pollTimer = window.setInterval(() => {
+    restoreScrollWhenReady()
+    tries++
+    if (tries >= 12) { // ~2s at 166ms
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
+    }
+  }, 166)
+}
+
+function unwireObservers() {
   try { mo?.disconnect() } catch {}
-  mo = null; scrollerEl = null
+  try { ro?.disconnect() } catch {}
+  mo = null; ro = null
+  if (scrollerEl) {
+    // remove all listeners by cloning (safe shortcut)
+    const clone = scrollerEl.cloneNode(true) as HTMLElement
+    scrollerEl.replaceWith(clone)
+    scrollerEl = clone
+  }
 }
 
-// --------- loader / teardown ----------
+// ---------- loading ----------
 async function loadDocument(path: string) {
   const container = containerRef.value
   if (!container) return
-  container.innerHTML = '' // clear old canvases/nodes
+  container.innerHTML = '' // clear previous
 
   const ext = getExt(path)
 
@@ -166,8 +180,20 @@ async function loadDocument(path: string) {
       toolbarOptions: { defaultTools: ['select','pen','highlight','erase','text','rectangle'] }
     })
 
+    // --- PDF.js event hooks if exposed ---
+    const pdfViewer = viewerInstance?.pdfViewer || viewerInstance?._pdfViewer
+    const eventBus  = viewerInstance?.eventBus  || pdfViewer?.eventBus
+    if (eventBus && typeof eventBus.on === 'function') {
+      // fires on scroll/page change → save
+      eventBus.on('updateviewarea', () => saveScroll())
+      // fires when all pages are loaded → restore
+      eventBus.on('pagesloaded', () => restoreScrollWhenReady())
+      // fires when a page is (re)rendered → attempt restore
+      eventBus.on('pagerendered', () => restoreScrollWhenReady())
+    }
+
     viewerInstance?.on?.('documentLoaded', () => {
-      attachMutationObserver()
+      wireScrollSaving()
       restoreScrollWhenReady()
     })
 
@@ -187,7 +213,7 @@ async function loadDocument(path: string) {
     })
 
     setTimeout(() => {
-      attachMutationObserver()
+      wireScrollSaving()
       restoreScrollWhenReady()
     }, 0)
   } else {
@@ -196,14 +222,15 @@ async function loadDocument(path: string) {
 }
 
 function teardown() {
-  detachMutationObserver()
+  unwireObservers()
   try { viewerInstance?.unload?.() || viewerInstance?.destroy?.() } catch {}
   try { editorInstance?.destroy?.() } catch {}
   viewerInstance = null
   editorInstance = null
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
-// --------- wiring ----------
+// ---------- lifecycle ----------
 onMounted(async () => {
   if (props.fileParam) {
     await nextTick()
