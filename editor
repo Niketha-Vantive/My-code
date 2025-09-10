@@ -4,36 +4,26 @@ import { onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
 const props = defineProps<{ fileParam: string }>()
 
 const containerRef = ref<HTMLDivElement | null>(null)
+const errorMsg = ref<string>('')           // show errors in UI
+const loadingMsg = ref<string>('')         // show loading state
+
 let viewerInstance: any = null
 let editorInstance: any = null
 let docAuthSystem: any = null
 
+// Resolve base URL for SDK assets (works with Vite + SPA base)
+const ASSETS_BASE = (import.meta as any).env?.BASE_URL || '/'
+
 // ---------- Scroll persistence ----------
-function getScrollKey(path: string | undefined) {
-  return `nutrient-scroll:${path ?? ''}`
-}
+function getScrollKey(path?: string) { return `nutrient-scroll:${path ?? ''}` }
 function saveScroll() {
-  const el = containerRef.value
-  if (!el) return
-  const key = getScrollKey(props.fileParam)
-  sessionStorage.setItem(key, String(el.scrollTop))
+  const el = containerRef.value; if (!el) return
+  sessionStorage.setItem(getScrollKey(props.fileParam), String(el.scrollTop))
 }
 function restoreScroll() {
-  const el = containerRef.value
-  if (!el) return
-  const key = getScrollKey(props.fileParam)
-  const saved = sessionStorage.getItem(key)
-  if (saved) {
-    requestAnimationFrame(() => {
-      el.scrollTop = parseInt(saved, 10) || 0
-    })
-  }
-}
-function attachScrollListener() {
-  containerRef.value?.addEventListener('scroll', saveScroll, { passive: true })
-}
-function detachScrollListener() {
-  containerRef.value?.removeEventListener('scroll', saveScroll)
+  const el = containerRef.value; if (!el) return
+  const saved = sessionStorage.getItem(getScrollKey(props.fileParam))
+  if (saved) requestAnimationFrame(() => { el.scrollTop = parseInt(saved, 10) || 0 })
 }
 // ---------------------------------------
 
@@ -41,51 +31,50 @@ function getFileExtension(url: string): string {
   return url.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
 }
 
+function setLoading(text: string) { loadingMsg.value = text; errorMsg.value = '' }
+function setError(text: string)   { errorMsg.value = text; loadingMsg.value = '' }
+
 async function loadDocument(path: string) {
-  console.log('[Nutrient] loadDocument:', path)
-  const extension = getFileExtension(path)
-  const container = containerRef.value
-  if (!container) {
-    console.error('Editor container not found!')
-    return
-  }
+  try {
+    setLoading('Loading document…')
+    const extension = getFileExtension(path)
+    const container = containerRef.value
+    if (!container) throw new Error('Editor container not found')
 
-  // Clear container before re-mount just in case
-  container.innerHTML = ''
+    // Clear container to avoid stacking canvases
+    container.innerHTML = ''
 
-  if (extension === 'pdf') {
-    const NutrientViewer = (await import('@nutrient-sdk/viewer')).default
-    viewerInstance = NutrientViewer.load({
-      container,
-      document: path,
-      baseUrl: `${window.location.protocol}//${window.location.host}/`,
-      enableEditing: true,
-      features: { toolbar: true, annotations: true, edit: true },
-      toolbarOptions: { defaultTools: ['select', 'pen', 'highlight', 'erase', 'text', 'rectangle'] }
-    })
+    if (extension === 'pdf') {
+      const NutrientViewer = (await import('@nutrient-sdk/viewer')).default
 
-    // Some builds emit 'documentLoaded', others just complete the promise/mount; use both.
-    viewerInstance?.on?.('documentLoaded', () => {
-      console.log('[Nutrient] PDF documentLoaded')
-      restoreScroll()
-      searchAndHighlight('Author')
-    })
+      // NOTE: pass assets base so SDK can find its workers/wasm
+      viewerInstance = NutrientViewer.load({
+        container,
+        document: path,
+        baseUrl: ASSETS_BASE,
+        assetsBaseUrl: ASSETS_BASE,
+        enableEditing: true,
+        features: { toolbar: true, annotations: true, edit: true },
+        toolbarOptions: { defaultTools: ['select', 'pen', 'highlight', 'erase', 'text', 'rectangle'] }
+      })
 
-    // Fallback: try restoring after a tick if no event fires
-    setTimeout(() => {
-      try { restoreScroll(); searchAndHighlight('Author') } catch {}
-    }, 0)
+      viewerInstance?.on?.('documentLoaded', () => {
+        setLoading('')
+        restoreScroll()
+        searchAndHighlight('Author')
+      })
 
-  } else if (extension === 'docx') {
-    const DocAuth = (await import('@nutrient-sdk/document-authoring')).default
-    docAuthSystem = await DocAuth.createDocAuthSystem()
+      // Fallback if event doesn’t fire
+      setTimeout(() => { if (loadingMsg.value) { setLoading(''); restoreScroll(); } }, 1000)
 
-    try {
+    } else if (extension === 'docx') {
+      const DocAuth = (await import('@nutrient-sdk/document-authoring')).default
+
+      // Important: give doc-authoring its asset base too
+      docAuthSystem = await DocAuth.createDocAuthSystem({ assetsBaseUrl: ASSETS_BASE })
+
       const response = await fetch(path, { cache: 'no-store' })
-      if (!response.ok) {
-        console.error(`Failed to fetch document: ${response.statusText}`)
-        return
-      }
+      if (!response.ok) throw new Error(`Fetch failed: ${response.status} ${response.statusText}`)
       const docxBlob = await response.blob()
       const doc = await docAuthSystem.importDOCX(docxBlob)
 
@@ -96,76 +85,63 @@ async function loadDocument(path: string) {
         toolbarOptions: { defaultTools: ['select', 'text', 'highlight', 'rectangle', 'structure'] }
       })
 
-      // Restore once layout exists
+      // Give layout a tick
       setTimeout(() => {
-        console.log('[Nutrient] DOCX editor ready')
+        setLoading('')
         restoreScroll()
         searchAndHighlight('Author')
       }, 0)
-
-    } catch (error) {
-      console.error('Error loading DOCX:', error)
+    } else {
+      setError(`Unsupported file type: .${extension}`)
     }
-  } else {
-    console.warn(`Unsupported file extension: .${extension}`)
+  } catch (e: any) {
+    console.error('[Nutrient] loadDocument error:', e)
+    setError(e?.message || 'Failed to load document')
   }
 }
 
 function teardown() {
-  try {
-    viewerInstance?.unload ? viewerInstance.unload() : viewerInstance?.destroy?.()
-  } catch {}
-  try {
-    editorInstance?.destroy?.()
-  } catch {}
+  try { viewerInstance?.unload ? viewerInstance.unload() : viewerInstance?.destroy?.() } catch {}
+  try { editorInstance?.destroy?.() } catch {}
   viewerInstance = null
   editorInstance = null
 }
 
-// Function to search and highlight text
+// Search & highlight helper
 function searchAndHighlight(term: string) {
   if (!term) return
   try {
-    if (viewerInstance?.findText) {
-      viewerInstance.findText({ query: term, highlightAll: true })
-      return
-    }
+    if (viewerInstance?.findText) { viewerInstance.findText({ query: term, highlightAll: true }); return }
     if (editorInstance?.findText) {
       const matches = editorInstance.findText(term)
-      matches?.forEach((range: any) => {
-        editorInstance.addHighlight(range, { color: 'yellow' })
-      })
+      matches?.forEach((range: any) => editorInstance.addHighlight(range, { color: 'yellow' }))
     }
-  } catch (e) {
-    console.warn('searchAndHighlight skipped:', e)
-  }
+  } catch (e) { console.warn('searchAndHighlight skipped:', e) }
 }
 
-// Load on first mount if fileParam already has a value
+// Initial load
 onMounted(async () => {
-  attachScrollListener()
+  containerRef.value?.addEventListener('scroll', saveScroll, { passive: true })
   if (props.fileParam) {
     await nextTick()
     await loadDocument(props.fileParam)
+  } else {
+    setError('No file selected')
   }
-  // If dev hot-reload, try to restore scroll anyway
-  nextTick(() => restoreScroll())
 })
 
-watch(
-  () => props.fileParam,
-  async (newPath, oldPath) => {
-    if (!newPath) return
-    if (oldPath) saveScroll()
-    teardown()
-    await nextTick()
-    await loadDocument(newPath)
-  }
-)
+// React to changes
+watch(() => props.fileParam, async (newPath, oldPath) => {
+  if (!newPath) { setError('No file selected'); return }
+  if (oldPath) saveScroll()
+  teardown()
+  await nextTick()
+  await loadDocument(newPath)
+})
 
 onUnmounted(() => {
   saveScroll()
-  detachScrollListener()
+  containerRef.value?.removeEventListener('scroll', saveScroll)
   teardown()
 })
 </script>
