@@ -7,25 +7,32 @@ const containerRef = ref<HTMLDivElement | null>(null)
 let viewerInstance: any = null
 let editorInstance: any = null
 let docAuthSystem: any = null
+
 let scrollerEl: HTMLElement | null = null
 let mo: MutationObserver | null = null
 
-// ---------- helpers ----------
-function basePath(path?: string) { return (path || '').split('?')[0] }
-function keyFor(path?: string) { return `nutrient-scroll:${basePath(path)}` }
+// --------- helpers ----------
+const basePath = (p?: string) => (p || '').split('?')[0]
+const keyFor = (p?: string) => `nutrient-scroll:${basePath(p)}`
 
+function getExt(url: string) {
+  return url.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
+}
+
+// Inner scroller & pages (PDF.js)
 function findInnerScroller(root: HTMLElement): HTMLElement {
-  const candidates = [
-    '.viewerContainer', '.pdfViewer',       // PDF.js
-    '.page-view', '.pages',                 // common wrappers
-    '.np-pages', '.nutrient-viewer',        // Nutrient-ish
-    '.editor-scroll'
-  ]
+  // hard-target PDF.js first
+  const pdfScroller = root.querySelector('.viewerContainer') as HTMLElement | null
+  if (pdfScroller && pdfScroller.scrollHeight > pdfScroller.clientHeight) return pdfScroller
+
+  // general fallbacks (DOCX/editor cases)
+  const candidates = ['.pdfViewer', '.np-pages', '.nutrient-viewer', '.editor-scroll']
   for (const sel of candidates) {
     const el = root.querySelector(sel) as HTMLElement | null
     if (el && el.scrollHeight > el.clientHeight + 4) return el
   }
-  // fallback: deepest element that scrolls
+
+  // last resort: deepest scrollable
   let best: HTMLElement = root
   const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
   let n: any
@@ -36,36 +43,39 @@ function findInnerScroller(root: HTMLElement): HTMLElement {
   return best
 }
 
-type ScrollState = { mode: 'page'|'raw'; pageIndex?: number; offsetPct?: number; scrollTop?: number }
-
 function getPages(scroller: HTMLElement) {
+  // PDF.js pages have class "page"
   return Array.from(scroller.querySelectorAll('.page,[data-page-number],[data-page-index]')) as HTMLElement[]
 }
 
+type ScrollState = { mode: 'page'|'raw'; pageIndex?: number; offsetPct?: number; scrollTop?: number }
+
+// Compute current page + within-page offset
 function computeScrollState(root: HTMLElement): ScrollState {
   const scroller = findInnerScroller(root)
   const pages = getPages(scroller)
   if (pages.length) {
     const st = scroller.scrollTop
     let idx = 0
-    for (let i=0;i<pages.length;i++) {
+    for (let i = 0; i < pages.length; i++) {
       if (pages[i].offsetTop <= st + 1) idx = i; else break
     }
     const p = pages[idx]
-    const delta = Math.max(0, Math.min(st - p.offsetTop, p.offsetHeight || 1))
-    return { mode:'page', pageIndex: idx+1, offsetPct: (p.offsetHeight? delta/p.offsetHeight : 0) }
+    const h = p.offsetHeight || 1
+    const delta = Math.max(0, Math.min(st - p.offsetTop, h))
+    return { mode: 'page', pageIndex: idx + 1, offsetPct: delta / h }
   }
-  return { mode:'raw', scrollTop: scroller.scrollTop }
+  return { mode: 'raw', scrollTop: scroller.scrollTop }
 }
 
 function applyScrollState(root: HTMLElement, state: ScrollState): boolean {
   const scroller = findInnerScroller(root)
   if (state.mode === 'page' && state.pageIndex && state.offsetPct != null) {
     const pages = getPages(scroller)
-    if (pages.length && state.pageIndex-1 < pages.length) {
-      const p = pages[state.pageIndex-1]
-      const tgt = p.offsetTop + state.offsetPct * (p.offsetHeight || 1)
-      scroller.scrollTo({ top: tgt })
+    if (pages.length && state.pageIndex - 1 < pages.length) {
+      const p = pages[state.pageIndex - 1]
+      const h = p.offsetHeight || 1
+      scroller.scrollTo({ top: p.offsetTop + state.offsetPct * h })
       return true
     }
   }
@@ -78,8 +88,7 @@ function applyScrollState(root: HTMLElement, state: ScrollState): boolean {
 
 function saveScroll() {
   const root = containerRef.value; if (!root) return
-  const st = computeScrollState(root)
-  sessionStorage.setItem(keyFor(props.fileParam), JSON.stringify(st))
+  sessionStorage.setItem(keyFor(props.fileParam), JSON.stringify(computeScrollState(root)))
 }
 
 function restoreScrollWhenReady() {
@@ -87,37 +96,45 @@ function restoreScrollWhenReady() {
   const raw = sessionStorage.getItem(keyFor(props.fileParam))
   if (!raw) return
   const state = JSON.parse(raw) as ScrollState
-  const start = performance.now(), timeout = 5000
+  const start = performance.now(), timeout = 7000
 
-  const tick = () => {
+  const tryApply = () => {
     if (applyScrollState(root, state)) return
     if (performance.now() - start > timeout) return
-    requestAnimationFrame(tick)
+    requestAnimationFrame(tryApply)
   }
-  requestAnimationFrame(tick)
+  requestAnimationFrame(tryApply)
 }
 
-// Observe inner page rebuilds and re-apply scroll
+// Observe inner page rebuilds (happens after chatbot autofill)
 function attachMutationObserver() {
   const root = containerRef.value; if (!root) return
   scrollerEl = findInnerScroller(root)
-  // save while the user scrolls
-  scrollerEl.addEventListener('scroll', onScroll, { passive: true })
 
-  let lastSig = signature()
-  function signature() {
+  // Save while the user scrolls (throttled)
+  const throttled = (() => {
+    let t: any = null
+    return () => {
+      if (t) return
+      t = setTimeout(() => { t = null; saveScroll() }, 120)
+    }
+  })()
+  scrollerEl.addEventListener('scroll', throttled, { passive: true })
+
+  // Signature of current page tree
+  const signature = () => {
     const pages = getPages(scrollerEl!)
-    // signature = page count + first/last page heights to catch reflow
     const first = pages[0]?.offsetHeight || 0
-    const last  = pages[pages.length-1]?.offsetHeight || 0
+    const last  = pages[pages.length - 1]?.offsetHeight || 0
     return `${pages.length}:${first}:${last}`
   }
+  let lastSig = signature()
 
   mo = new MutationObserver(() => {
     const s = signature()
     if (s !== lastSig) {
       lastSig = s
-      // pages likely rebuilt after autofill → restore
+      // Inner DOM changed → likely rebuild after autofill
       restoreScrollWhenReady()
     }
   })
@@ -125,29 +142,19 @@ function attachMutationObserver() {
 }
 
 function detachMutationObserver() {
-  try { scrollerEl?.removeEventListener('scroll', onScroll) } catch {}
+  try { scrollerEl?.replaceWith(scrollerEl!) } catch {} // noop to drop listeners if needed
   try { mo?.disconnect() } catch {}
   mo = null; scrollerEl = null
 }
 
-function onScroll() {
-  // throttle saving a bit
-  if ((onScroll as any)._t) return
-  ;(onScroll as any)._t = setTimeout(() => {
-    (onScroll as any)._t = null
-    saveScroll()
-  }, 150)
-}
-
-// ---------- viewer/editor load ----------
-function getExt(url: string){ return url.split('?')[0].split('.').pop()?.toLowerCase() ?? '' }
-
+// --------- loader / teardown ----------
 async function loadDocument(path: string) {
   const container = containerRef.value
   if (!container) return
-  container.innerHTML = '' // clean
+  container.innerHTML = '' // clear old canvases/nodes
 
   const ext = getExt(path)
+
   if (ext === 'pdf') {
     const NutrientViewer = (await import('@nutrient-sdk/viewer')).default
     viewerInstance = NutrientViewer.load({
@@ -184,7 +191,7 @@ async function loadDocument(path: string) {
       restoreScrollWhenReady()
     }, 0)
   } else {
-    console.warn('Unsupported:', ext)
+    console.warn('Unsupported file type:', ext)
   }
 }
 
@@ -192,10 +199,11 @@ function teardown() {
   detachMutationObserver()
   try { viewerInstance?.unload?.() || viewerInstance?.destroy?.() } catch {}
   try { editorInstance?.destroy?.() } catch {}
-  viewerInstance = null; editorInstance = null
+  viewerInstance = null
+  editorInstance = null
 }
 
-// ---------- wiring ----------
+// --------- wiring ----------
 onMounted(async () => {
   if (props.fileParam) {
     await nextTick()
