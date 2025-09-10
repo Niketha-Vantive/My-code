@@ -1,0 +1,36 @@
+// Finds the real scrollable element + page nodes even through shadow roots.
+(function () {
+  function deepWalk(root, visit) {
+    const stack = [root];
+    while (stack.length) {
+      const n = stack.pop();
+      if (!n) continue;
+      visit(n);
+      if (n.shadowRoot) stack.push(n.shadowRoot);
+      if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+    }
+  }
+  function isScrollable(el){
+    if (!(el instanceof HTMLElement)) return false;
+    const cs = getComputedStyle(el);
+    const hasY = /(auto|scroll)/.test(cs.overflowY) || /(auto|scroll)/.test(cs.overflow);
+    return hasY && el.scrollHeight > el.clientHeight + 4;
+  }
+
+  const container = document.querySelector('.container') || document.body;
+  let scroller = null, pages = [];
+  deepWalk(container, (node) => { if (!scroller && isScrollable(node)) scroller = node; });
+  if (scroller) {
+    deepWalk(scroller, (node) => {
+      if (node instanceof HTMLElement) {
+        if (node.classList?.contains('page') || node.hasAttribute?.('data-page-number') || node.hasAttribute?.('data-page-index')) {
+          pages.push(node);
+        }
+      }
+    });
+  }
+  console.log('SCROLLER=', scroller);
+  console.log('PAGES=', pages.length);
+  if (scroller) { scroller.style.outline = '2px solid #4caf50'; setTimeout(()=> scroller.style.outline='', 1500); }
+  return { scroller, pages: pages.length };
+})();
