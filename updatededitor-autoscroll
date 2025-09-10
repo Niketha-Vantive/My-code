@@ -7,30 +7,27 @@ const containerRef = ref<HTMLDivElement | null>(null)
 let viewerInstance: any = null
 let editorInstance: any = null
 let docAuthSystem: any = null
-
 let scrollerEl: HTMLElement | null = null
 let mo: MutationObserver | null = null
-let ro: ResizeObserver | null = null
-let pollTimer: number | null = null
 
-// ---------- utils ----------
+// --------- helpers ----------
 const basePath = (p?: string) => (p || '').split('?')[0]
-const keyFor   = (p?: string) => `nutrient-scroll:${basePath(p)}`
-const getExt   = (u: string) => u.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
+const keyFor = (p?: string) => `nutrient-scroll:${basePath(p)}`
+const getExt = (url: string) => url.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
 
 function findInnerScroller(root: HTMLElement): HTMLElement {
-  // PDF.js typical structure
-  const pdfScroller = root.querySelector('.viewerContainer') as HTMLElement | null
-  if (pdfScroller && pdfScroller.scrollHeight > pdfScroller.clientHeight) return pdfScroller
+  // Prefer PDF.js scroller
+  const pdf = root.querySelector('.viewerContainer') as HTMLElement | null
+  if (pdf && pdf.scrollHeight > pdf.clientHeight) return pdf
 
-  // Other likely wrappers
+  // Fallbacks used by other renderers
   const candidates = ['.pdfViewer', '.np-pages', '.nutrient-viewer', '.editor-scroll']
   for (const sel of candidates) {
     const el = root.querySelector(sel) as HTMLElement | null
     if (el && el.scrollHeight > el.clientHeight + 4) return el
   }
 
-  // Fallback: deepest scrollable node
+  // Deepest scrollable element
   let best: HTMLElement = root
   const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
   let n: any
@@ -92,80 +89,58 @@ function restoreScrollWhenReady() {
   const raw = sessionStorage.getItem(keyFor(props.fileParam))
   if (!raw) return
   const state = JSON.parse(raw) as ScrollState
-
-  const start = performance.now(), timeout = 8000
-  const tryApply = () => {
+  const start = performance.now(), timeout = 7000
+  const tick = () => {
     if (applyScrollState(root, state)) return
     if (performance.now() - start > timeout) return
-    requestAnimationFrame(tryApply)
+    requestAnimationFrame(tick)
   }
-  requestAnimationFrame(tryApply)
+  requestAnimationFrame(tick)
 }
 
-// ---------- observers & hooks ----------
-function wireScrollSaving() {
+// Observe inner page rebuilds (happens after chatbot autofill)
+function attachMutationObserver() {
   const root = containerRef.value; if (!root) return
   scrollerEl = findInnerScroller(root)
 
   // Save while the user scrolls (throttled)
-  const throttled = (() => {
-    let t: any = null
-    return () => {
-      if (t) return
-      t = setTimeout(() => { t = null; saveScroll() }, 120)
-    }
-  })()
-  scrollerEl.addEventListener('scroll', throttled, { passive: true })
+  let t: any = null
+  const onScroll = () => {
+    if (t) return
+    t = setTimeout(() => { t = null; saveScroll() }, 120)
+  }
+  scrollerEl.addEventListener('scroll', onScroll, { passive: true })
 
-  // MutationObserver (child list changes)
+  // Track page tree changes
+  const signature = () => {
+    const pages = getPages(scrollerEl!)
+    const first = pages[0]?.offsetHeight || 0
+    const last  = pages[pages.length - 1]?.offsetHeight || 0
+    return `${pages.length}:${first}:${last}`
+  }
+  let lastSig = signature()
+
   mo = new MutationObserver(() => {
-    // DOM changed → likely rebuild or canvases swapped
-    kickRestoreCycle()
+    const s = signature()
+    if (s !== lastSig) {
+      lastSig = s
+      restoreScrollWhenReady()
+    }
   })
   mo.observe(scrollerEl, { childList: true, subtree: true })
-
-  // ResizeObserver (page canvas relaid out without DOM change)
-  ro = new ResizeObserver(() => {
-    // Layout changed → restore to previous page/offset
-    kickRestoreCycle()
-  })
-  // observe scroller & first page (covers most PDF.js repaints)
-  ro.observe(scrollerEl)
-  const firstPage = getPages(scrollerEl)[0]
-  if (firstPage) ro.observe(firstPage)
 }
 
-// After any detected update, attempt several times to restore
-function kickRestoreCycle() {
-  // Quick multi-try (covers silent repaints)
-  let tries = 0
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
-  pollTimer = window.setInterval(() => {
-    restoreScrollWhenReady()
-    tries++
-    if (tries >= 12) { // ~2s at 166ms
-      if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
-    }
-  }, 166)
-}
-
-function unwireObservers() {
+function detachMutationObserver() {
   try { mo?.disconnect() } catch {}
-  try { ro?.disconnect() } catch {}
-  mo = null; ro = null
-  if (scrollerEl) {
-    // remove all listeners by cloning (safe shortcut)
-    const clone = scrollerEl.cloneNode(true) as HTMLElement
-    scrollerEl.replaceWith(clone)
-    scrollerEl = clone
-  }
+  mo = null
+  scrollerEl = null
 }
 
-// ---------- loading ----------
+// --------- loader / teardown ----------
 async function loadDocument(path: string) {
   const container = containerRef.value
   if (!container) return
-  container.innerHTML = '' // clear previous
+  container.innerHTML = '' // clear old DOM
 
   const ext = getExt(path)
 
@@ -180,20 +155,8 @@ async function loadDocument(path: string) {
       toolbarOptions: { defaultTools: ['select','pen','highlight','erase','text','rectangle'] }
     })
 
-    // --- PDF.js event hooks if exposed ---
-    const pdfViewer = viewerInstance?.pdfViewer || viewerInstance?._pdfViewer
-    const eventBus  = viewerInstance?.eventBus  || pdfViewer?.eventBus
-    if (eventBus && typeof eventBus.on === 'function') {
-      // fires on scroll/page change → save
-      eventBus.on('updateviewarea', () => saveScroll())
-      // fires when all pages are loaded → restore
-      eventBus.on('pagesloaded', () => restoreScrollWhenReady())
-      // fires when a page is (re)rendered → attempt restore
-      eventBus.on('pagerendered', () => restoreScrollWhenReady())
-    }
-
     viewerInstance?.on?.('documentLoaded', () => {
-      wireScrollSaving()
+      attachMutationObserver()
       restoreScrollWhenReady()
     })
 
@@ -213,7 +176,7 @@ async function loadDocument(path: string) {
     })
 
     setTimeout(() => {
-      wireScrollSaving()
+      attachMutationObserver()
       restoreScrollWhenReady()
     }, 0)
   } else {
@@ -222,15 +185,14 @@ async function loadDocument(path: string) {
 }
 
 function teardown() {
-  unwireObservers()
+  detachMutationObserver()
   try { viewerInstance?.unload?.() || viewerInstance?.destroy?.() } catch {}
   try { editorInstance?.destroy?.() } catch {}
   viewerInstance = null
   editorInstance = null
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
 }
 
-// ---------- lifecycle ----------
+// --------- wiring ----------
 onMounted(async () => {
   if (props.fileParam) {
     await nextTick()
@@ -252,33 +214,25 @@ onUnmounted(() => {
 })
 </script>
 
+<template>
+  <div v-if="!fileParam" class="placeholder">Please select the template first.</div>
+  <div v-else ref="containerRef" class="container"></div>
+</template>
 
-
-
-
-watch(
-  () => props.fileParam,
-  async (newPath, oldPath) => {
-    // 1) Ignore falsy values (don't blank the viewer)
-    if (!newPath) return
-    // 2) Ignore duplicates (chatbot may emit same URL again)
-    if (newPath === oldPath) return
-
-    // Optional: if you cache-bust with ?t=..., treat same base as same file
-    const base = (s: string) => s.split('?')[0]
-    if (oldPath && base(newPath) === base(oldPath)) {
-      // same file, different cache-buster → still reload, but keep scroll
-      // (your existing save/restore code is fine here)
-    }
-
-    // Normal teardown + reload
-    try { viewerInstance?.unload?.(containerRef.value) } catch {}
-    try { editorInstance?.destroy?.() } catch {}
-    viewerInstance = null
-    editorInstance = null
-
-    await nextTick()
-    await loadDocument(newPath)
-  }
-)
-
+<style scoped>
+.container {
+  width: 100%;
+  height: calc(100vh - 64px);
+  position: relative;
+  overflow: hidden; /* inner viewer owns scrolling */
+}
+.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100vh - 64px);
+  font-size: 18px;
+  color: #888;
+  font-style: italic;
+}
+</style>
