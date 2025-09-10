@@ -24,22 +24,16 @@ function restoreScroll() {
   const key = getScrollKey(props.fileParam)
   const saved = sessionStorage.getItem(key)
   if (saved) {
-    // Defer to let Nutrient lay out pages first
     requestAnimationFrame(() => {
       el.scrollTop = parseInt(saved, 10) || 0
     })
   }
 }
-
 function attachScrollListener() {
-  const el = containerRef.value
-  if (!el) return
-  el.addEventListener('scroll', saveScroll, { passive: true })
+  containerRef.value?.addEventListener('scroll', saveScroll, { passive: true })
 }
 function detachScrollListener() {
-  const el = containerRef.value
-  if (!el) return
-  el.removeEventListener('scroll', saveScroll)
+  containerRef.value?.removeEventListener('scroll', saveScroll)
 }
 // ---------------------------------------
 
@@ -48,12 +42,16 @@ function getFileExtension(url: string): string {
 }
 
 async function loadDocument(path: string) {
+  console.log('[Nutrient] loadDocument:', path)
   const extension = getFileExtension(path)
   const container = containerRef.value
   if (!container) {
     console.error('Editor container not found!')
     return
   }
+
+  // Clear container before re-mount just in case
+  container.innerHTML = ''
 
   if (extension === 'pdf') {
     const NutrientViewer = (await import('@nutrient-sdk/viewer')).default
@@ -66,11 +64,17 @@ async function loadDocument(path: string) {
       toolbarOptions: { defaultTools: ['select', 'pen', 'highlight', 'erase', 'text', 'rectangle'] }
     })
 
-    // When PDF pages are laid out, restore scroll then (and every reload)
-    viewerInstance.on('documentLoaded', () => {
+    // Some builds emit 'documentLoaded', others just complete the promise/mount; use both.
+    viewerInstance?.on?.('documentLoaded', () => {
+      console.log('[Nutrient] PDF documentLoaded')
       restoreScroll()
       searchAndHighlight('Author')
     })
+
+    // Fallback: try restoring after a tick if no event fires
+    setTimeout(() => {
+      try { restoreScroll(); searchAndHighlight('Author') } catch {}
+    }, 0)
 
   } else if (extension === 'docx') {
     const DocAuth = (await import('@nutrient-sdk/document-authoring')).default
@@ -92,8 +96,9 @@ async function loadDocument(path: string) {
         toolbarOptions: { defaultTools: ['select', 'text', 'highlight', 'rectangle', 'structure'] }
       })
 
-      // Give the layout a tick, then restore scroll & search
+      // Restore once layout exists
       setTimeout(() => {
+        console.log('[Nutrient] DOCX editor ready')
         restoreScroll()
         searchAndHighlight('Author')
       }, 0)
@@ -106,71 +111,61 @@ async function loadDocument(path: string) {
   }
 }
 
+function teardown() {
+  try {
+    viewerInstance?.unload ? viewerInstance.unload() : viewerInstance?.destroy?.()
+  } catch {}
+  try {
+    editorInstance?.destroy?.()
+  } catch {}
+  viewerInstance = null
+  editorInstance = null
+}
+
 // Function to search and highlight text
 function searchAndHighlight(term: string) {
   if (!term) return
-
-  if (viewerInstance?.findText) {
-    viewerInstance.findText({ query: term, highlightAll: true })
-    return
-  }
-
-  if (editorInstance?.findText) {
-    const matches = editorInstance.findText(term)
-    matches.forEach((range: any) => {
-      editorInstance.addHighlight(range, { color: 'yellow' })
-    })
+  try {
+    if (viewerInstance?.findText) {
+      viewerInstance.findText({ query: term, highlightAll: true })
+      return
+    }
+    if (editorInstance?.findText) {
+      const matches = editorInstance.findText(term)
+      matches?.forEach((range: any) => {
+        editorInstance.addHighlight(range, { color: 'yellow' })
+      })
+    }
+  } catch (e) {
+    console.warn('searchAndHighlight skipped:', e)
   }
 }
+
+// Load on first mount if fileParam already has a value
+onMounted(async () => {
+  attachScrollListener()
+  if (props.fileParam) {
+    await nextTick()
+    await loadDocument(props.fileParam)
+  }
+  // If dev hot-reload, try to restore scroll anyway
+  nextTick(() => restoreScroll())
+})
 
 watch(
   () => props.fileParam,
   async (newPath, oldPath) => {
     if (!newPath) return
-
-    // Save scroll for the old doc before teardown
     if (oldPath) saveScroll()
-
-    // Cleanup old instances
-    if (viewerInstance?.unload) viewerInstance.unload(containerRef.value)
-    if (editorInstance?.destroy) editorInstance.destroy()
-    viewerInstance = null
-    editorInstance = null
-
+    teardown()
     await nextTick()
     await loadDocument(newPath)
   }
 )
 
-onMounted(() => {
-  attachScrollListener()
-  // If the first render already has a file, restore immediately (useful on hot reloads)
-  nextTick(() => restoreScroll())
-})
-
 onUnmounted(() => {
   saveScroll()
   detachScrollListener()
-  if (viewerInstance?.unload) viewerInstance.unload(containerRef.value)
-  if (editorInstance?.destroy) editorInstance.destroy()
+  teardown()
 })
 </script>
-
-<style scoped>
-.container {
-  width: 100%;
-  height: calc(100vh - 64px);
-  position: relative;
-  overflow: auto; /* make this the scroll owner we control */
-}
-
-.placeholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: calc(100vh - 64px);
-  font-size: 18px;
-  color: #888;
-  font-style: italic;
-}
-</style>
