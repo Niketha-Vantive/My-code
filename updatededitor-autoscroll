@@ -7,220 +7,195 @@ const containerRef = ref<HTMLDivElement | null>(null)
 let viewerInstance: any = null
 let editorInstance: any = null
 let docAuthSystem: any = null
+let scrollerEl: HTMLElement | null = null
+let mo: MutationObserver | null = null
 
-// ========= Scroll persistence targeting the INNER scroller =========
+// ---------- helpers ----------
+function basePath(path?: string) { return (path || '').split('?')[0] }
+function keyFor(path?: string) { return `nutrient-scroll:${basePath(path)}` }
 
-// Try to find the element that actually scrolls (inside Nutrient)
 function findInnerScroller(root: HTMLElement): HTMLElement {
-  // Common containers (PDF.js / editors)
   const candidates = [
-    '.viewerContainer',       // PDF.js default
-    '.pdfViewer',             // PDF.js page collection
-    '.nutrient-viewer',       // hypothetical Nutrient container
-    '.np-pages',              // hypothetical DOCX pages wrapper
-    '.editor-scroll',         // generic
+    '.viewerContainer', '.pdfViewer',       // PDF.js
+    '.page-view', '.pages',                 // common wrappers
+    '.np-pages', '.nutrient-viewer',        // Nutrient-ish
+    '.editor-scroll'
   ]
   for (const sel of candidates) {
     const el = root.querySelector(sel) as HTMLElement | null
-    if (el && el.scrollHeight > el.clientHeight) return el
+    if (el && el.scrollHeight > el.clientHeight + 4) return el
   }
-
-  // Fallback: find the deepest descendant that actually scrolls
+  // fallback: deepest element that scrolls
   let best: HTMLElement = root
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
-  let node: any
-  while ((node = walker.nextNode())) {
-    const el = node as HTMLElement
-    if (el.scrollHeight > el.clientHeight + 8) best = el
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
+  let n: any
+  while ((n = w.nextNode())) {
+    const el = n as HTMLElement
+    if (el.scrollHeight > el.clientHeight + 4) best = el
   }
   return best
 }
 
-type ScrollState = {
-  mode: 'page' | 'raw'
-  pageIndex?: number      // 1-based if we detect page nodes
-  offsetPct?: number      // 0..1 within that page
-  scrollTop?: number      // fallback raw pixels
+type ScrollState = { mode: 'page'|'raw'; pageIndex?: number; offsetPct?: number; scrollTop?: number }
+
+function getPages(scroller: HTMLElement) {
+  return Array.from(scroller.querySelectorAll('.page,[data-page-number],[data-page-index]')) as HTMLElement[]
 }
 
-function keyFor(path?: string) {
-  const base = (path || '').split('?')[0]
-  return `nutrient-scroll:${base}`
-}
-
-// Identify current visible "page" element and relative offset
 function computeScrollState(root: HTMLElement): ScrollState {
   const scroller = findInnerScroller(root)
-  // Try to find page nodes (.page, [data-page-number], etc.)
-  const pageSel = '.page,[data-page-number],[data-page-index]'
-  const pages = Array.from(scroller.querySelectorAll(pageSel)) as HTMLElement[]
-
+  const pages = getPages(scroller)
   if (pages.length) {
-    // Find the page whose top is closest above the viewport top
-    const scTop = scroller.scrollTop
-    let bestIdx = 0
-    for (let i = 0; i < pages.length; i++) {
-      const p = pages[i]
-      const top = p.offsetTop
-      if (top <= scTop + 1) bestIdx = i
-      else break
+    const st = scroller.scrollTop
+    let idx = 0
+    for (let i=0;i<pages.length;i++) {
+      if (pages[i].offsetTop <= st + 1) idx = i; else break
     }
-    const page = pages[bestIdx]
-    const pageTop = page.offsetTop
-    const pageHeight = page.offsetHeight || 1
-    const delta = Math.max(0, Math.min(scTop - pageTop, pageHeight))
-    const offsetPct = delta / pageHeight
-    // Page numbers in PDF.js are 1-based
-    return { mode: 'page', pageIndex: bestIdx + 1, offsetPct }
+    const p = pages[idx]
+    const delta = Math.max(0, Math.min(st - p.offsetTop, p.offsetHeight || 1))
+    return { mode:'page', pageIndex: idx+1, offsetPct: (p.offsetHeight? delta/p.offsetHeight : 0) }
   }
-
-  // Fallback: raw scrollTop
-  return { mode: 'raw', scrollTop: scroller.scrollTop }
+  return { mode:'raw', scrollTop: scroller.scrollTop }
 }
 
 function applyScrollState(root: HTMLElement, state: ScrollState): boolean {
   const scroller = findInnerScroller(root)
-
   if (state.mode === 'page' && state.pageIndex && state.offsetPct != null) {
-    const pageSel = '.page,[data-page-number],[data-page-index]'
-    const pages = Array.from(scroller.querySelectorAll(pageSel)) as HTMLElement[]
-    if (pages.length && state.pageIndex - 1 < pages.length) {
-      const page = pages[state.pageIndex - 1]
-      const pageTop = page.offsetTop
-      const pageHeight = page.offsetHeight || 1
-      const target = pageTop + state.offsetPct * pageHeight
-      scroller.scrollTo({ top: target, behavior: 'instant' as any })
+    const pages = getPages(scroller)
+    if (pages.length && state.pageIndex-1 < pages.length) {
+      const p = pages[state.pageIndex-1]
+      const tgt = p.offsetTop + state.offsetPct * (p.offsetHeight || 1)
+      scroller.scrollTo({ top: tgt })
       return true
     }
   }
-
   if (state.mode === 'raw' && typeof state.scrollTop === 'number') {
-    scroller.scrollTo({ top: state.scrollTop, behavior: 'instant' as any })
+    scroller.scrollTo({ top: state.scrollTop })
     return true
   }
-
   return false
 }
 
-function saveScroll(root: HTMLElement) {
+function saveScroll() {
+  const root = containerRef.value; if (!root) return
   const st = computeScrollState(root)
   sessionStorage.setItem(keyFor(props.fileParam), JSON.stringify(st))
 }
 
-function restoreScrollWhenReady(root: HTMLElement) {
+function restoreScrollWhenReady() {
+  const root = containerRef.value; if (!root) return
   const raw = sessionStorage.getItem(keyFor(props.fileParam))
   if (!raw) return
-  const state: ScrollState = JSON.parse(raw)
+  const state = JSON.parse(raw) as ScrollState
+  const start = performance.now(), timeout = 5000
 
-  // Wait until pages exist (after layout) then apply
-  const start = performance.now()
-  const timeoutMs = 5000
-
-  const tryApply = () => {
-    const ok = applyScrollState(root, state)
-    if (ok) return
-    if (performance.now() - start > timeoutMs) return
-    requestAnimationFrame(tryApply)
+  const tick = () => {
+    if (applyScrollState(root, state)) return
+    if (performance.now() - start > timeout) return
+    requestAnimationFrame(tick)
   }
-  requestAnimationFrame(tryApply)
+  requestAnimationFrame(tick)
 }
 
-// ========= Viewer / Editor loader =========
+// Observe inner page rebuilds and re-apply scroll
+function attachMutationObserver() {
+  const root = containerRef.value; if (!root) return
+  scrollerEl = findInnerScroller(root)
+  // save while the user scrolls
+  scrollerEl.addEventListener('scroll', onScroll, { passive: true })
 
-function getFileExtension(url: string): string {
-  return url.split('?')[0].split('.').pop()?.toLowerCase() ?? ''
+  let lastSig = signature()
+  function signature() {
+    const pages = getPages(scrollerEl!)
+    // signature = page count + first/last page heights to catch reflow
+    const first = pages[0]?.offsetHeight || 0
+    const last  = pages[pages.length-1]?.offsetHeight || 0
+    return `${pages.length}:${first}:${last}`
+  }
+
+  mo = new MutationObserver(() => {
+    const s = signature()
+    if (s !== lastSig) {
+      lastSig = s
+      // pages likely rebuilt after autofill → restore
+      restoreScrollWhenReady()
+    }
+  })
+  mo.observe(scrollerEl, { childList: true, subtree: true })
 }
+
+function detachMutationObserver() {
+  try { scrollerEl?.removeEventListener('scroll', onScroll) } catch {}
+  try { mo?.disconnect() } catch {}
+  mo = null; scrollerEl = null
+}
+
+function onScroll() {
+  // throttle saving a bit
+  if ((onScroll as any)._t) return
+  ;(onScroll as any)._t = setTimeout(() => {
+    (onScroll as any)._t = null
+    saveScroll()
+  }, 150)
+}
+
+// ---------- viewer/editor load ----------
+function getExt(url: string){ return url.split('?')[0].split('.').pop()?.toLowerCase() ?? '' }
 
 async function loadDocument(path: string) {
-  const extension = getFileExtension(path)
   const container = containerRef.value
-  if (!container) {
-    console.error('Editor container not found!')
-    return
-  }
+  if (!container) return
+  container.innerHTML = '' // clean
 
-  // Clean container to avoid duplicated canvases
-  container.innerHTML = ''
-
-  if (extension === 'pdf') {
+  const ext = getExt(path)
+  if (ext === 'pdf') {
     const NutrientViewer = (await import('@nutrient-sdk/viewer')).default
     viewerInstance = NutrientViewer.load({
       container,
       document: path,
-      baseUrl: `${window.location.protocol}//${window.location.host}/`,
+      baseUrl: `${location.protocol}//${location.host}/`,
       enableEditing: true,
       features: { toolbar: true, annotations: true, edit: true },
-      toolbarOptions: { defaultTools: ['select', 'pen', 'highlight', 'erase', 'text', 'rectangle'] }
+      toolbarOptions: { defaultTools: ['select','pen','highlight','erase','text','rectangle'] }
     })
 
-    // When pages are laid out, restore scroll
     viewerInstance?.on?.('documentLoaded', () => {
-      restoreScrollWhenReady(container)
-      searchAndHighlight('Author')
-      // Attach scroll listener to INNER scroller
-      const scroller = findInnerScroller(container)
-      scroller.addEventListener('scroll', () => saveScroll(container), { passive: true })
+      attachMutationObserver()
+      restoreScrollWhenReady()
     })
 
-  } else if (extension === 'docx') {
+  } else if (ext === 'docx') {
     const DocAuth = (await import('@nutrient-sdk/document-authoring')).default
     docAuthSystem = await DocAuth.createDocAuthSystem()
+    const res = await fetch(path, { cache: 'no-store' })
+    if (!res.ok) { console.error('Fetch failed', res.status); return }
+    const blob = await res.blob()
+    const doc = await docAuthSystem.importDOCX(blob)
 
-    try {
-      const response = await fetch(path, { cache: 'no-store' })
-      if (!response.ok) {
-        console.error(`Failed to fetch document: ${response.statusText}`)
-        return
-      }
-      const docxBlob = await response.blob()
-      const doc = await docAuthSystem.importDOCX(docxBlob)
+    editorInstance = await docAuthSystem.createEditor(container, {
+      document: doc,
+      enableEditing: true,
+      features: { toolbar: true, annotations: true, edit: true, structure: true },
+      toolbarOptions: { defaultTools: ['select','text','highlight','rectangle','structure'] }
+    })
 
-      editorInstance = await docAuthSystem.createEditor(container, {
-        document: doc,
-        enableEditing: true,
-        features: { toolbar: true, annotations: true, edit: true, structure: true },
-        toolbarOptions: { defaultTools: ['select', 'text', 'highlight', 'rectangle', 'structure'] }
-      })
-
-      // Wait a tick for layout, then restore & hook scroll
-      setTimeout(() => {
-        restoreScrollWhenReady(container)
-        searchAndHighlight('Author')
-        const scroller = findInnerScroller(container)
-        scroller.addEventListener('scroll', () => saveScroll(container), { passive: true })
-      }, 0)
-    } catch (error) {
-      console.error('Error loading DOCX:', error)
-    }
+    setTimeout(() => {
+      attachMutationObserver()
+      restoreScrollWhenReady()
+    }, 0)
   } else {
-    console.warn(`Unsupported file extension: .${extension}`)
+    console.warn('Unsupported:', ext)
   }
 }
 
 function teardown() {
+  detachMutationObserver()
   try { viewerInstance?.unload?.() || viewerInstance?.destroy?.() } catch {}
   try { editorInstance?.destroy?.() } catch {}
-  viewerInstance = null
-  editorInstance = null
+  viewerInstance = null; editorInstance = null
 }
 
-// ========= Highlight helper =========
-function searchAndHighlight(term: string) {
-  if (!term) return
-  try {
-    if (viewerInstance?.findText) {
-      viewerInstance.findText({ query: term, highlightAll: true })
-      return
-    }
-    if (editorInstance?.findText) {
-      const matches = editorInstance.findText(term)
-      matches?.forEach((range: any) => editorInstance.addHighlight(range, { color: 'yellow' }))
-    }
-  } catch {}
-}
-
-// ========= Wiring =========
-
+// ---------- wiring ----------
 onMounted(async () => {
   if (props.fileParam) {
     await nextTick()
@@ -228,20 +203,16 @@ onMounted(async () => {
   }
 })
 
-watch(
-  () => props.fileParam,
-  async (newPath, oldPath) => {
-    if (!newPath) return
-    // Save scroll for the previous doc (if any)
-    if (oldPath && containerRef.value) saveScroll(containerRef.value)
-    teardown()
-    await nextTick()
-    await loadDocument(newPath)
-  }
-)
+watch(() => props.fileParam, async (newPath, oldPath) => {
+  if (!newPath) return
+  if (oldPath) saveScroll()
+  teardown()
+  await nextTick()
+  await loadDocument(newPath)
+})
 
 onUnmounted(() => {
-  try { if (containerRef.value) saveScroll(containerRef.value) } catch {}
+  saveScroll()
   teardown()
 })
 </script>
