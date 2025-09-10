@@ -251,3 +251,34 @@ onUnmounted(() => {
   teardown()
 })
 </script>
+
+
+
+
+
+watch(
+  () => props.fileParam,
+  async (newPath, oldPath) => {
+    // 1) Ignore falsy values (don't blank the viewer)
+    if (!newPath) return
+    // 2) Ignore duplicates (chatbot may emit same URL again)
+    if (newPath === oldPath) return
+
+    // Optional: if you cache-bust with ?t=..., treat same base as same file
+    const base = (s: string) => s.split('?')[0]
+    if (oldPath && base(newPath) === base(oldPath)) {
+      // same file, different cache-buster → still reload, but keep scroll
+      // (your existing save/restore code is fine here)
+    }
+
+    // Normal teardown + reload
+    try { viewerInstance?.unload?.(containerRef.value) } catch {}
+    try { editorInstance?.destroy?.() } catch {}
+    viewerInstance = null
+    editorInstance = null
+
+    await nextTick()
+    await loadDocument(newPath)
+  }
+)
+
