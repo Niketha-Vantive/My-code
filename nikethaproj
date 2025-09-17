@@ -15,14 +15,34 @@ import subprocess
 import sys
 import os
 import csv
-import re  # <-- added for SID extraction
+import re
+import xml.etree.ElementTree as ET
+
+# ------------------------------
+# CONFIG: tell us where your XMLs are if needed.
+# If your XMLs live elsewhere or have different names, edit this dict.
+# Keys should match the language name we pass to -file= (e.g., "English").
+LANG_XML_PATHS = {
+    # 'English': r'English.xml',
+    # 'Danish': r'Languages/Danish.xml',
+    # 'Czech': r'Languages/Czech.xml',
+    # 'Croation': r'Languages/Croatian.xml',   # (typo in original code: "Croation")
+}
+
+# If not in LANG_XML_PATHS, we will try these fallbacks (in this order):
+FALLBACK_XML_PATTERNS = [
+    "{name}.xml",
+    os.path.join("Languages", "{name}.xml"),
+    os.path.join("languages", "{name}.xml"),
+    os.path.join(".", "{name}.xml"),
+]
 
 Languages_To_Test = (
-        ('Croation', 'LT'),
-        ('Czech', 'LT'),
-        ('Danish', 'LT'),
-        ('English', 'LT')
-    )
+    ('Croation', 'LT'),  # note: original had "Croation"; keep as-is
+    ('Czech', 'LT'),
+    ('Danish', 'LT'),
+    ('English', 'LT')
+)
 
 def run_executable(exe_path, arg1, arg2, arg3):
     """
@@ -37,7 +57,6 @@ def run_executable(exe_path, arg1, arg2, arg3):
     Returns:
         subprocess.CompletedProcess: Result of the execution
     """
-    
     # Check if executable exists
     if not os.path.exists(exe_path):
         print(f"Error: Executable not found at {exe_path}")
@@ -48,7 +67,6 @@ def run_executable(exe_path, arg1, arg2, arg3):
         print(f"Warning: {exe_path} may not be executable")
     
     try:
-        # Run the executable with arguments
         result = subprocess.run(
             [exe_path, arg1, arg2, arg3],
             capture_output=True,
@@ -57,17 +75,13 @@ def run_executable(exe_path, arg1, arg2, arg3):
             check=False  # Don't raise exception on non-zero exit code
         )
         
-        ############## I think this is where we want to look if the exe opened correctly i.e. the screen/variation actually exists
+        # Status
         print(f"Command executed: {exe_path} {arg1} {arg2} {arg3}")
         print(f"Exit code: {result.returncode}")
-        ############## Exit code 0 means it worked, not sure about failed cases
         
-        # Print stdout if any
         if result.stdout:
             print("Output:")
             print(result.stdout)
-        
-        # Print stderr if any
         if result.stderr:
             print("Errors:")
             print(result.stderr)
@@ -91,14 +105,12 @@ def GetListofScreensAndVariations():
                 screens.append(row)
             except:
                 print("Failed to Read Row in .csv")
-                
     return screens
 
 # ------------------------------
-# STEP 1: return SIDs only
+# STEP 1: return SIDs only (unchanged from your working Step 1)
 # ------------------------------
 
-# Patterns we try to find a SID in a line (adjust if your file uses a different format)
 SID_PATTERNS = [
     re.compile(r'\bSID\s*[:=]\s*(\d+)\b', re.IGNORECASE),  # e.g., "SID=12345" or "SID: 12345"
     re.compile(r'^\s*(\d+)\b'),                            # e.g., "12345 some text"
@@ -144,29 +156,419 @@ def GetStringsForScreen_Var(screen, var):
                     sids.append(sid)
 
     return sids
+
+# ------------------------------
+# STEP 2: Load language XML and map SID -> localized text
 # ------------------------------
 
+def resolve_language_xml(lang_name: str) -> str | None:
+    """
+    Try to resolve the XML path for a given language name.
+    1) Look in LANG_XML_PATHS config.
+    2) Try a few common fallback patterns.
+    Returns a path string or None if not found.
+    """
+    # Exact mapping provided by user
+    if lang_name in LANG_XML_PATHS:
+        candidate = LANG_XML_PATHS[lang_name]
+        if os.path.exists(candidate):
+            return candidate
+        else:
+            print(f"[WARN] Configured path not found for {lang_name}: {candidate}")
 
-def LoopThroughScreens(executable_path, language, font):
+    # Try simple fallbacks
+    for pattern in FALLBACK_XML_PATTERNS:
+        candidate = pattern.format(name=lang_name)
+        if os.path.exists(candidate):
+            return candidate
+
+    print(f"[WARN] Could not resolve XML for language '{lang_name}'. Tried defaults. "
+          f"Please set LANG_XML_PATHS['{lang_name}'] to the correct file path.")
+    return None
+
+def load_language_map(xml_path: str) -> dict:
+    """
+    Parse the language XML and build a dict { 'SID': 'localized text', ... }.
+
+    This is schema-flexible: it tries a few common patterns:
+      - <String id="706">CRRT</String>
+      - <String sid="706" text="CRRT" />
+      - <String><SID>706</SID><Text>CRRT</Text></String>
+    Adjust selectors if your XML differs.
+    """
+    sid_to_text = {}
+
+    if not xml_path or not os.path.exists(xml_path):
+        print(f"[WARN] Language XML not found at: {xml_path}")
+        return sid_to_text
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        # Try a few likely tag names for each string entry
+        # (You can add more tag names if needed)
+        candidate_nodes = list(root.iter())
+        for node in candidate_nodes:
+            tag_lower = node.tag.lower()
+
+            # Heuristic: treat any node named 'string' (or similar) as a string entry
+            if tag_lower in ("string", "entry", "resource", "textitem"):
+                sid = None
+                text = None
+
+                # Try attribute-based SIDs/text
+                sid = node.get('id') or node.get('sid') or sid
+                text = node.get('text') or text
+
+                # Try child nodes: <SID>706</SID>, <Id>706</Id>
+                if sid is None:
+                    for child in node:
+                        child_tag = child.tag.lower()
+                        if child_tag in ("sid", "id"):
+                            if child.text:
+                                sid = child.text.strip()
+                        if child_tag in ("text", "value", "string"):
+                            if child.text:
+                                text = child.text.strip()
+
+                # If still no text, try node.text (for <String id="706">CRRT</String>)
+                if text is None:
+                    raw = (node.text or "").strip()
+                    if raw:
+                        text = raw
+
+                # Normalize and store
+                if sid:
+                    sid = sid.strip()
+                    if text is None:
+                        # No text found; warn once per missing SID
+                        print(f"[WARN] No text for SID {sid} in {xml_path}")
+                    else:
+                        sid_to_text[sid] = text
+
+        return sid_to_text
+
+    except ET.ParseError as e:
+        print(f"[ERROR] Failed to parse XML '{xml_path}': {e}")
+        return sid_to_text
+
+def LoopThroughScreens(executable_path, language, font, lang_map: dict):
     listOfScreens = GetListofScreensAndVariations()
     print(listOfScreens)
     
-    for var in listOfScreens: # Start looping through all screens/variations
+    for var in listOfScreens:  # Start looping through all screens/variations
         screen = var[0]
         variation = var[1]
         
         # Start populating the cmd line string
-        string = r'-screenNum=' # Create the last argument string
-        string = string + str(screen) + ';' + str(variation) # make it look like -screenNum=screen;variation ex. -screenNum=700;1
-        screen_var = string                # Third argument
+        string = r'-screenNum='
+        string = string + str(screen) + ';' + str(variation)  # e.g. -screenNum=700;1
+        screen_var = string  # Third argument
         
-        # Get the SIDs for the specific screen/variation we are looking at (STEP 1)
+        # Get SIDs for the screen/variation
         sids = GetStringsForScreen_Var(screen, variation)
         print(f"SIDs for Screen {screen};{variation}:", sids)
+
+        # Map SIDs to localized text using lang_map (STEP 2)
+        expected_items = [(sid, lang_map.get(sid)) for sid in sids]
+        # Print a readable summary
+        pretty = [f"{sid} => {txt if txt is not None else '(MISSING IN XML)'}"
+                  for sid, txt in expected_items]
+        print("Expected strings from XML:", pretty)
         
         # Run the executable
-        # might have to figure out something slightly different here since it doesn't return until you close the window. 
-        # Need to figure out how to tell if the exe successfully launched and then after we are done doing the image analysis, we must close the window and return
+        # NOTE: right now this blocks until closed. That's okay for MVP.
+        result = run_executable(executable_path, language, font, screen_var)
+        if result and result.returncode == 0:
+            print("Program executed successfully!")
+        elif result:
+            print(f"Program finished with exit code {result.returncode}")
+        else:
+            print("Failed to execute program")
+            
+def LoopThroughLanguages():
+    # Exe name#!/usr/bin/env python3
+# I made some progress on the script this weekend. 
+# So far it will loop through a list of languages and then loop through all 
+# screens/variations defined in an input file 
+# (this will be the one created by you parsing the code). 
+# It will then search the "zStringsVsScreens.txt" file and capture all of the strings 
+# that are on the corresponding screen/var. 
+
+# So you will still need to strip those strings out of the variable that is holding them, 
+# and then use that to parse the language.xml file. 
+# I can probably help with that part too if I have some time later this week. 
+# Let me know if you want to walk through it at all
+
+import subprocess
+import sys
+import os
+import csv
+import re
+import xml.etree.ElementTree as ET
+
+# ------------------------------
+# CONFIG: tell us where your XMLs are if needed.
+# If your XMLs live elsewhere or have different names, edit this dict.
+# Keys should match the language name we pass to -file= (e.g., "English").
+LANG_XML_PATHS = {
+    # 'English': r'English.xml',
+    # 'Danish': r'Languages/Danish.xml',
+    # 'Czech': r'Languages/Czech.xml',
+    # 'Croation': r'Languages/Croatian.xml',   # (typo in original code: "Croation")
+}
+
+# If not in LANG_XML_PATHS, we will try these fallbacks (in this order):
+FALLBACK_XML_PATTERNS = [
+    "{name}.xml",
+    os.path.join("Languages", "{name}.xml"),
+    os.path.join("languages", "{name}.xml"),
+    os.path.join(".", "{name}.xml"),
+]
+
+Languages_To_Test = (
+    ('Croation', 'LT'),  # note: original had "Croation"; keep as-is
+    ('Czech', 'LT'),
+    ('Danish', 'LT'),
+    ('English', 'LT')
+)
+
+def run_executable(exe_path, arg1, arg2, arg3):
+    """
+    Run an executable file with three arguments.
+    
+    Args:
+        exe_path (str): Path to the executable file
+        arg1 (str): First argument
+        arg2 (str): Second argument
+        arg3 (str): Third argument
+    
+    Returns:
+        subprocess.CompletedProcess: Result of the execution
+    """
+    # Check if executable exists
+    if not os.path.exists(exe_path):
+        print(f"Error: Executable not found at {exe_path}")
+        return None
+    
+    # Check if file is executable (Unix-like systems)
+    if not os.access(exe_path, os.X_OK):
+        print(f"Warning: {exe_path} may not be executable")
+    
+    try:
+        result = subprocess.run(
+            [exe_path, arg1, arg2, arg3],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False  # Don't raise exception on non-zero exit code
+        )
+        
+        # Status
+        print(f"Command executed: {exe_path} {arg1} {arg2} {arg3}")
+        print(f"Exit code: {result.returncode}")
+        
+        if result.stdout:
+            print("Output:")
+            print(result.stdout)
+        if result.stderr:
+            print("Errors:")
+            print(result.stderr)
+        
+        return result
+        
+    except FileNotFoundError:
+        print(f"Error: Could not find executable: {exe_path}")
+        return None
+    except Exception as e:
+        print(f"Error running executable: {e}")
+        return None
+        
+def GetListofScreensAndVariations():
+    screens = []
+    with open('StringsAndVariations.csv', newline='') as f:
+        reader = csv.reader(f)
+        next(reader) # skip the header, could do a check to make sure file is in expected format
+        for row in reader:
+            try:
+                screens.append(row)
+            except:
+                print("Failed to Read Row in .csv")
+    return screens
+
+# ------------------------------
+# STEP 1: return SIDs only (unchanged from your working Step 1)
+# ------------------------------
+
+SID_PATTERNS = [
+    re.compile(r'\bSID\s*[:=]\s*(\d+)\b', re.IGNORECASE),  # e.g., "SID=12345" or "SID: 12345"
+    re.compile(r'^\s*(\d+)\b'),                            # e.g., "12345 some text"
+    re.compile(r'\[(\d+)\]'),                              # e.g., "[12345]"
+]
+
+def extract_sid(line: str):
+    """Return the numeric SID as a string if found in the line; otherwise None."""
+    for pat in SID_PATTERNS:
+        m = pat.search(line)
+        if m:
+            return m.group(1)
+    # Fallback: grab the first 4+ digit chunk (avoids matching tiny numbers)
+    m = re.search(r'\b(\d{4,})\b', line)
+    return m.group(1) if m else None
+
+def GetStringsForScreen_Var(screen, var):
+    """
+    Reads zStringsVsScreens.txt, finds the block for the given screen/variation,
+    and returns a clean list of SIDs (strings of digits), e.g. ['12345','67890'].
+    """
+    foundVar = False
+    sids = []
+
+    header_prefix = "Screen = " + str(screen) + ","
+    header_suffix = " Variation = " + str(var) + " uses the following SIDs:"
+
+    with open('zStringsVsScreens.txt', 'r', encoding='utf-8') as file:
+        for line in file:
+            # Detect the start of the block for this screen/variation
+            if not foundVar and (header_prefix + header_suffix) in line:
+                foundVar = True
+                continue
+
+            # Stop when the block ends (blank line)
+            if foundVar and line.strip() == '':
+                break
+
+            # While inside the block, extract SIDs
+            if foundVar:
+                sid = extract_sid(line)
+                if sid:
+                    sids.append(sid)
+
+    return sids
+
+# ------------------------------
+# STEP 2: Load language XML and map SID -> localized text
+# ------------------------------
+
+def resolve_language_xml(lang_name: str) -> str | None:
+    """
+    Try to resolve the XML path for a given language name.
+    1) Look in LANG_XML_PATHS config.
+    2) Try a few common fallback patterns.
+    Returns a path string or None if not found.
+    """
+    # Exact mapping provided by user
+    if lang_name in LANG_XML_PATHS:
+        candidate = LANG_XML_PATHS[lang_name]
+        if os.path.exists(candidate):
+            return candidate
+        else:
+            print(f"[WARN] Configured path not found for {lang_name}: {candidate}")
+
+    # Try simple fallbacks
+    for pattern in FALLBACK_XML_PATTERNS:
+        candidate = pattern.format(name=lang_name)
+        if os.path.exists(candidate):
+            return candidate
+
+    print(f"[WARN] Could not resolve XML for language '{lang_name}'. Tried defaults. "
+          f"Please set LANG_XML_PATHS['{lang_name}'] to the correct file path.")
+    return None
+
+def load_language_map(xml_path: str) -> dict:
+    """
+    Parse the language XML and build a dict { 'SID': 'localized text', ... }.
+
+    This is schema-flexible: it tries a few common patterns:
+      - <String id="706">CRRT</String>
+      - <String sid="706" text="CRRT" />
+      - <String><SID>706</SID><Text>CRRT</Text></String>
+    Adjust selectors if your XML differs.
+    """
+    sid_to_text = {}
+
+    if not xml_path or not os.path.exists(xml_path):
+        print(f"[WARN] Language XML not found at: {xml_path}")
+        return sid_to_text
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        # Try a few likely tag names for each string entry
+        # (You can add more tag names if needed)
+        candidate_nodes = list(root.iter())
+        for node in candidate_nodes:
+            tag_lower = node.tag.lower()
+
+            # Heuristic: treat any node named 'string' (or similar) as a string entry
+            if tag_lower in ("string", "entry", "resource", "textitem"):
+                sid = None
+                text = None
+
+                # Try attribute-based SIDs/text
+                sid = node.get('id') or node.get('sid') or sid
+                text = node.get('text') or text
+
+                # Try child nodes: <SID>706</SID>, <Id>706</Id>
+                if sid is None:
+                    for child in node:
+                        child_tag = child.tag.lower()
+                        if child_tag in ("sid", "id"):
+                            if child.text:
+                                sid = child.text.strip()
+                        if child_tag in ("text", "value", "string"):
+                            if child.text:
+                                text = child.text.strip()
+
+                # If still no text, try node.text (for <String id="706">CRRT</String>)
+                if text is None:
+                    raw = (node.text or "").strip()
+                    if raw:
+                        text = raw
+
+                # Normalize and store
+                if sid:
+                    sid = sid.strip()
+                    if text is None:
+                        # No text found; warn once per missing SID
+                        print(f"[WARN] No text for SID {sid} in {xml_path}")
+                    else:
+                        sid_to_text[sid] = text
+
+        return sid_to_text
+
+    except ET.ParseError as e:
+        print(f"[ERROR] Failed to parse XML '{xml_path}': {e}")
+        return sid_to_text
+
+def LoopThroughScreens(executable_path, language, font, lang_map: dict):
+    listOfScreens = GetListofScreensAndVariations()
+    print(listOfScreens)
+    
+    for var in listOfScreens:  # Start looping through all screens/variations
+        screen = var[0]
+        variation = var[1]
+        
+        # Start populating the cmd line string
+        string = r'-screenNum='
+        string = string + str(screen) + ';' + str(variation)  # e.g. -screenNum=700;1
+        screen_var = string  # Third argument
+        
+        # Get SIDs for the screen/variation
+        sids = GetStringsForScreen_Var(screen, variation)
+        print(f"SIDs for Screen {screen};{variation}:", sids)
+
+        # Map SIDs to localized text using lang_map (STEP 2)
+        expected_items = [(sid, lang_map.get(sid)) for sid in sids]
+        # Print a readable summary
+        pretty = [f"{sid} => {txt if txt is not None else '(MISSING IN XML)'}"
+                  for sid, txt in expected_items]
+        print("Expected strings from XML:", pretty)
+        
+        # Run the executable
+        # NOTE: right now this blocks until closed. That's okay for MVP.
         result = run_executable(executable_path, language, font, screen_var)
         if result and result.returncode == 0:
             print("Program executed successfully!")
@@ -179,16 +581,359 @@ def LoopThroughLanguages():
     # Exe name
     executable_path = "DesktopCP.exe"  # assuming that the exe is in the same directory as this script
     
-    for language in Languages_To_Test: # Start looping through all languages and their corresponding font
-        lang = language[0]
+    for language in Languages_To_Test:  # Start looping through all languages and their corresponding font
+        lang_name = language[0]  # e.g., "English"
         font = language[1]
 
-        language_arg = "-file=" + lang       # First argument
-        font_arg = "-font=" + font           # Second argument
+        language_arg = "-file=" + lang_name   # First argument
+        font_arg = "-font=" + font            # Second argument
         print(language_arg)
         print(font_arg)
+
+        # STEP 2: Load language map once per language
+        xml_path = resolve_language_xml(lang_name)
+        lang_map = load_language_map(xml_path) if xml_path else {}
+        print(f"Loaded {len(lang_map)} entries from: {xml_path if xml_path else '(none)'}")
+
+        LoopThroughScreens(executable_path, language_arg, font_arg, lang_map)
+
+def main():
+    LoopThroughLanguages()
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+# I made some progress on the script this weekend. 
+# So far it will loop through a list of languages and then loop through all 
+# screens/variations defined in an input file 
+# (this will be the one created by you parsing the code). 
+# It will then search the "zStringsVsScreens.txt" file and capture all of the strings 
+# that are on the corresponding screen/var. 
+
+# So you will still need to strip those strings out of the variable that is holding them, 
+# and then use that to parse the language.xml file. 
+# I can probably help with that part too if I have some time later this week. 
+# Let me know if you want to walk through it at all
+
+import subprocess
+import sys
+import os
+import csv
+import re
+import xml.etree.ElementTree as ET
+
+# ------------------------------
+# CONFIG: tell us where your XMLs are if needed.
+# If your XMLs live elsewhere or have different names, edit this dict.
+# Keys should match the language name we pass to -file= (e.g., "English").
+LANG_XML_PATHS = {
+    # 'English': r'English.xml',
+    # 'Danish': r'Languages/Danish.xml',
+    # 'Czech': r'Languages/Czech.xml',
+    # 'Croation': r'Languages/Croatian.xml',   # (typo in original code: "Croation")
+}
+
+# If not in LANG_XML_PATHS, we will try these fallbacks (in this order):
+FALLBACK_XML_PATTERNS = [
+    "{name}.xml",
+    os.path.join("Languages", "{name}.xml"),
+    os.path.join("languages", "{name}.xml"),
+    os.path.join(".", "{name}.xml"),
+]
+
+Languages_To_Test = (
+    ('Croation', 'LT'),  # note: original had "Croation"; keep as-is
+    ('Czech', 'LT'),
+    ('Danish', 'LT'),
+    ('English', 'LT')
+)
+
+def run_executable(exe_path, arg1, arg2, arg3):
+    """
+    Run an executable file with three arguments.
+    
+    Args:
+        exe_path (str): Path to the executable file
+        arg1 (str): First argument
+        arg2 (str): Second argument
+        arg3 (str): Third argument
+    
+    Returns:
+        subprocess.CompletedProcess: Result of the execution
+    """
+    # Check if executable exists
+    if not os.path.exists(exe_path):
+        print(f"Error: Executable not found at {exe_path}")
+        return None
+    
+    # Check if file is executable (Unix-like systems)
+    if not os.access(exe_path, os.X_OK):
+        print(f"Warning: {exe_path} may not be executable")
+    
+    try:
+        result = subprocess.run(
+            [exe_path, arg1, arg2, arg3],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False  # Don't raise exception on non-zero exit code
+        )
         
-        LoopThroughScreens(executable_path, language_arg, font_arg)
+        # Status
+        print(f"Command executed: {exe_path} {arg1} {arg2} {arg3}")
+        print(f"Exit code: {result.returncode}")
+        
+        if result.stdout:
+            print("Output:")
+            print(result.stdout)
+        if result.stderr:
+            print("Errors:")
+            print(result.stderr)
+        
+        return result
+        
+    except FileNotFoundError:
+        print(f"Error: Could not find executable: {exe_path}")
+        return None
+    except Exception as e:
+        print(f"Error running executable: {e}")
+        return None
+        
+def GetListofScreensAndVariations():
+    screens = []
+    with open('StringsAndVariations.csv', newline='') as f:
+        reader = csv.reader(f)
+        next(reader) # skip the header, could do a check to make sure file is in expected format
+        for row in reader:
+            try:
+                screens.append(row)
+            except:
+                print("Failed to Read Row in .csv")
+    return screens
+
+# ------------------------------
+# STEP 1: return SIDs only (unchanged from your working Step 1)
+# ------------------------------
+
+SID_PATTERNS = [
+    re.compile(r'\bSID\s*[:=]\s*(\d+)\b', re.IGNORECASE),  # e.g., "SID=12345" or "SID: 12345"
+    re.compile(r'^\s*(\d+)\b'),                            # e.g., "12345 some text"
+    re.compile(r'\[(\d+)\]'),                              # e.g., "[12345]"
+]
+
+def extract_sid(line: str):
+    """Return the numeric SID as a string if found in the line; otherwise None."""
+    for pat in SID_PATTERNS:
+        m = pat.search(line)
+        if m:
+            return m.group(1)
+    # Fallback: grab the first 4+ digit chunk (avoids matching tiny numbers)
+    m = re.search(r'\b(\d{4,})\b', line)
+    return m.group(1) if m else None
+
+def GetStringsForScreen_Var(screen, var):
+    """
+    Reads zStringsVsScreens.txt, finds the block for the given screen/variation,
+    and returns a clean list of SIDs (strings of digits), e.g. ['12345','67890'].
+    """
+    foundVar = False
+    sids = []
+
+    header_prefix = "Screen = " + str(screen) + ","
+    header_suffix = " Variation = " + str(var) + " uses the following SIDs:"
+
+    with open('zStringsVsScreens.txt', 'r', encoding='utf-8') as file:
+        for line in file:
+            # Detect the start of the block for this screen/variation
+            if not foundVar and (header_prefix + header_suffix) in line:
+                foundVar = True
+                continue
+
+            # Stop when the block ends (blank line)
+            if foundVar and line.strip() == '':
+                break
+
+            # While inside the block, extract SIDs
+            if foundVar:
+                sid = extract_sid(line)
+                if sid:
+                    sids.append(sid)
+
+    return sids
+
+# ------------------------------
+# STEP 2: Load language XML and map SID -> localized text
+# ------------------------------
+
+def resolve_language_xml(lang_name: str) -> str | None:
+    """
+    Try to resolve the XML path for a given language name.
+    1) Look in LANG_XML_PATHS config.
+    2) Try a few common fallback patterns.
+    Returns a path string or None if not found.
+    """
+    # Exact mapping provided by user
+    if lang_name in LANG_XML_PATHS:
+        candidate = LANG_XML_PATHS[lang_name]
+        if os.path.exists(candidate):
+            return candidate
+        else:
+            print(f"[WARN] Configured path not found for {lang_name}: {candidate}")
+
+    # Try simple fallbacks
+    for pattern in FALLBACK_XML_PATTERNS:
+        candidate = pattern.format(name=lang_name)
+        if os.path.exists(candidate):
+            return candidate
+
+    print(f"[WARN] Could not resolve XML for language '{lang_name}'. Tried defaults. "
+          f"Please set LANG_XML_PATHS['{lang_name}'] to the correct file path.")
+    return None
+
+def load_language_map(xml_path: str) -> dict:
+    """
+    Parse the language XML and build a dict { 'SID': 'localized text', ... }.
+
+    This is schema-flexible: it tries a few common patterns:
+      - <String id="706">CRRT</String>
+      - <String sid="706" text="CRRT" />
+      - <String><SID>706</SID><Text>CRRT</Text></String>
+    Adjust selectors if your XML differs.
+    """
+    sid_to_text = {}
+
+    if not xml_path or not os.path.exists(xml_path):
+        print(f"[WARN] Language XML not found at: {xml_path}")
+        return sid_to_text
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        # Try a few likely tag names for each string entry
+        # (You can add more tag names if needed)
+        candidate_nodes = list(root.iter())
+        for node in candidate_nodes:
+            tag_lower = node.tag.lower()
+
+            # Heuristic: treat any node named 'string' (or similar) as a string entry
+            if tag_lower in ("string", "entry", "resource", "textitem"):
+                sid = None
+                text = None
+
+                # Try attribute-based SIDs/text
+                sid = node.get('id') or node.get('sid') or sid
+                text = node.get('text') or text
+
+                # Try child nodes: <SID>706</SID>, <Id>706</Id>
+                if sid is None:
+                    for child in node:
+                        child_tag = child.tag.lower()
+                        if child_tag in ("sid", "id"):
+                            if child.text:
+                                sid = child.text.strip()
+                        if child_tag in ("text", "value", "string"):
+                            if child.text:
+                                text = child.text.strip()
+
+                # If still no text, try node.text (for <String id="706">CRRT</String>)
+                if text is None:
+                    raw = (node.text or "").strip()
+                    if raw:
+                        text = raw
+
+                # Normalize and store
+                if sid:
+                    sid = sid.strip()
+                    if text is None:
+                        # No text found; warn once per missing SID
+                        print(f"[WARN] No text for SID {sid} in {xml_path}")
+                    else:
+                        sid_to_text[sid] = text
+
+        return sid_to_text
+
+    except ET.ParseError as e:
+        print(f"[ERROR] Failed to parse XML '{xml_path}': {e}")
+        return sid_to_text
+
+def LoopThroughScreens(executable_path, language, font, lang_map: dict):
+    listOfScreens = GetListofScreensAndVariations()
+    print(listOfScreens)
+    
+    for var in listOfScreens:  # Start looping through all screens/variations
+        screen = var[0]
+        variation = var[1]
+        
+        # Start populating the cmd line string
+        string = r'-screenNum='
+        string = string + str(screen) + ';' + str(variation)  # e.g. -screenNum=700;1
+        screen_var = string  # Third argument
+        
+        # Get SIDs for the screen/variation
+        sids = GetStringsForScreen_Var(screen, variation)
+        print(f"SIDs for Screen {screen};{variation}:", sids)
+
+        # Map SIDs to localized text using lang_map (STEP 2)
+        expected_items = [(sid, lang_map.get(sid)) for sid in sids]
+        # Print a readable summary
+        pretty = [f"{sid} => {txt if txt is not None else '(MISSING IN XML)'}"
+                  for sid, txt in expected_items]
+        print("Expected strings from XML:", pretty)
+        
+        # Run the executable
+        # NOTE: right now this blocks until closed. That's okay for MVP.
+        result = run_executable(executable_path, language, font, screen_var)
+        if result and result.returncode == 0:
+            print("Program executed successfully!")
+        elif result:
+            print(f"Program finished with exit code {result.returncode}")
+        else:
+            print("Failed to execute program")
+            
+def LoopThroughLanguages():
+    # Exe name
+    executable_path = "DesktopCP.exe"  # assuming that the exe is in the same directory as this script
+    
+    for language in Languages_To_Test:  # Start looping through all languages and their corresponding font
+        lang_name = language[0]  # e.g., "English"
+        font = language[1]
+
+        language_arg = "-file=" + lang_name   # First argument
+        font_arg = "-font=" + font            # Second argument
+        print(language_arg)
+        print(font_arg)
+
+        # STEP 2: Load language map once per language
+        xml_path = resolve_language_xml(lang_name)
+        lang_map = load_language_map(xml_path) if xml_path else {}
+        print(f"Loaded {len(lang_map)} entries from: {xml_path if xml_path else '(none)'}")
+
+        LoopThroughScreens(executable_path, language_arg, font_arg, lang_map)
+
+def main():
+    LoopThroughLanguages()
+
+if __name__ == "__main__":
+    main()
+
+    executable_path = "DesktopCP.exe"  # assuming that the exe is in the same directory as this script
+    
+    for language in Languages_To_Test:  # Start looping through all languages and their corresponding font
+        lang_name = language[0]  # e.g., "English"
+        font = language[1]
+
+        language_arg = "-file=" + lang_name   # First argument
+        font_arg = "-font=" + font            # Second argument
+        print(language_arg)
+        print(font_arg)
+
+        # STEP 2: Load language map once per language
+        xml_path = resolve_language_xml(lang_name)
+        lang_map = load_language_map(xml_path) if xml_path else {}
+        print(f"Loaded {len(lang_map)} entries from: {xml_path if xml_path else '(none)'}")
+
+        LoopThroughScreens(executable_path, language_arg, font_arg, lang_map)
 
 def main():
     LoopThroughLanguages()
