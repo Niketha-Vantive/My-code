@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-# I made some progress on the script this weekend. 
-# So far it will loop through a list of languages and then loop through all 
-# screens/variations defined in an input file 
-# (this will be the one created by you parsing the code). 
-# It will then search the "zStringsVsScreens.txt" file and capture all of the strings 
-# that are on the corresponding screen/var. 
-
-# So you will still need to strip those strings out of the variable that is holding them, 
-# and then use that to parse the language.xml file. 
-# I can probably help with that part too if I have some time later this week. 
-# Let me know if you want to walk through it at all
+# Step 1 + Step 2 only (no OCR). Parses SpreadsheetML language XMLs in ./strings/
 
 import subprocess
 import sys
@@ -19,13 +9,19 @@ import re
 from typing import Optional, List
 import xml.etree.ElementTree as ET
 
+# ------------------------------
+# Languages to test (fixed 'Croatian' spelling)
+# ------------------------------
 Languages_To_Test = (
-        ('Croation', 'LT'),
-        ('Czech', 'LT'),
-        ('Danish', 'LT'),
-        ('English', 'LT')
-    )
+    ('Croatian', 'LT'),
+    ('Czech',    'LT'),
+    ('Danish',   'LT'),
+    ('English',  'LT'),
+)
 
+# ------------------------------
+# Keep your original executable runner (unchanged)
+# ------------------------------
 def run_executable(exe_path, arg1, arg2, arg3):
     """
     Run an executable file with three arguments.
@@ -62,6 +58,9 @@ def run_executable(exe_path, arg1, arg2, arg3):
         print(f"Error running executable: {e}")
         return None
 
+# ------------------------------
+# CSV: screens & variations
+# ------------------------------
 def GetListofScreensAndVariations():
     screens = []
     with open('StringsAndVariations.csv', newline='') as f:
@@ -75,7 +74,7 @@ def GetListofScreensAndVariations():
     return screens
 
 # ------------------------------
-# STEP 1: Return SIDs only
+# STEP 1: Return SIDs only from zStringsVsScreens.txt
 # ------------------------------
 SID_PATTERNS = [
     re.compile(r'\bSID\s*[:=]\s*(\d+)\b', re.IGNORECASE),  # "SID=12345" / "SID: 12345"
@@ -89,8 +88,8 @@ def extract_sid(line: str):
         m = pat.search(line)
         if m:
             return m.group(1)
-    # Fallback: first 4+ digit chunk
-    m = re.search(r'\b(\d{4,})\b', line)
+    # Fallback: first 3+ digit chunk
+    m = re.search(r'\b(\d{3,})\b', line)
     return m.group(1) if m else None
 
 def GetStringsForScreen_Var(screen, var):
@@ -119,11 +118,22 @@ def GetStringsForScreen_Var(screen, var):
                     sids.append(sid)
 
     return sids
-# ------------------------------
 
 # ------------------------------
-# STEP 2: Load language XML (SpreadsheetML) → { SID: text } and map SIDs to texts
+# STEP 2: SpreadsheetML (.xml) → { SID: text }
 # ------------------------------
+
+# Your files are Excel 2003 XML (SpreadsheetML) with this namespace:
+SS_NS = "urn:schemas-microsoft-com:office:spreadsheet"
+SS = f"{{{SS_NS}}}"  # for ElementTree tag names like f".//{SS}Row"
+
+# language header synonyms (expand if needed)
+LANGUAGE_SYNONYMS = {
+    "english":  ["english", "en", "eng"],
+    "czech":    ["czech", "čeština", "ces", "cs", "česky"],
+    "danish":   ["danish", "dansk", "da"],
+    "croatian": ["croatian", "hrvatski", "hr", "hrv"],
+}
 
 def parse_language_name(language_arg: str) -> str:
     """
@@ -151,18 +161,13 @@ def get_language_xml_path(language_name: str) -> Optional[str]:
     print(f"Warning: Could not find XML for language '{language_name}'. Tried: {candidates}")
     return None
 
-# === SpreadsheetML helpers ===
-
-SS_NS = "urn:schemas-microsoft-com:office:spreadsheet"
-SS = f"{{{SS_NS}}}"  # namespace wrapper for ElementTree tag names
-
+# ---- SpreadsheetML utilities ----
 def _text(elem: Optional[ET.Element]) -> str:
     return (elem.text or "").strip() if elem is not None else ""
 
 def _row_to_cells(row: ET.Element) -> List[str]:
     """
     Convert a SpreadsheetML Row into a list of cell values (handling ss:Index gaps).
-    Returns a list of strings, each the Data text of the cell (or "" if blank).
     """
     cells: List[str] = []
     col_idx = 0
@@ -185,7 +190,6 @@ def _read_spreadsheetml_rows(xml_path: str) -> List[List[str]]:
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    # Find the first Worksheet/Table
     ws = root.find(f".//{SS}Worksheet")
     if ws is None:
         return []
@@ -197,10 +201,30 @@ def _read_spreadsheetml_rows(xml_path: str) -> List[List[str]]:
         rows.append(_row_to_cells(row))
     return rows
 
+# ---- robust header + column detection ----
+def _norm(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _is_sid_header(val: str) -> bool:
+    v = _norm(val)
+    return v in {"sid", "id", "stringid", "sid#", "sid number", "string id"}
+
+def _looks_like_sid_number(s: str) -> bool:
+    return s.isdigit() and len(s) >= 3
+
+def _language_candidates(lang_name: str) -> List[str]:
+    base = _norm(lang_name)
+    syns = LANGUAGE_SYNONYMS.get(base, [])
+    return list({base, *syns})
+
 def load_language_map(xml_path: Optional[str], language_name: str = "English") -> dict:
     """
-    Parse SpreadsheetML (Excel 2003 XML) and build { SID: localized_text } using
-    the header row to locate the 'SID' column and the '<language_name>' column.
+    Parse SpreadsheetML and build { SID(number as string) : localized_text }.
+    Strategy:
+      1) Find a header row that contains a SID-like header and a language-like header
+         (accepts synonyms like 'Hrvatski' for Croatian).
+      2) If language header not found, pick the right-most non-empty header cell.
+      3) If SID header not found, pick the column most often numeric in subsequent rows.
     """
     sid_to_text = {}
     if not xml_path:
@@ -212,40 +236,67 @@ def load_language_map(xml_path: Optional[str], language_name: str = "English") -
             print(f"Error: No rows found in SpreadsheetML '{xml_path}'.")
             return {}
 
-        # Find header row: look for a row containing 'SID' and the language name.
         header_idx = -1
         sid_col = -1
         lang_col = -1
+        lang_cands = _language_candidates(language_name)
 
-        # Normalize header candidate cells by stripping spaces
+        # Pass 1: row with both SID-ish header and language-ish header
         for i, row in enumerate(rows):
-            lowered = [c.strip() for c in row]
-            # Typical headers might be: ["ID", "Date", "SID", "English", ...]
-            if "sid" in (x.lower() for x in lowered) and language_name.lower() in (x.lower() for x in lowered):
+            lowered = [_norm(c) for c in row]
+            sid_cols = [j for j, v in enumerate(lowered) if _is_sid_header(v)]
+            lang_cols = [j for j, v in enumerate(lowered) if v and any(v == c for c in lang_cands)]
+            if sid_cols and lang_cols:
                 header_idx = i
-                # Decide exact columns
-                for j, val in enumerate(lowered):
-                    if val.lower() == "sid":
-                        sid_col = j
-                    if val.lower() == language_name.lower():
-                        lang_col = j
+                sid_col = sid_cols[0]
+                lang_col = lang_cols[0]
                 break
 
-        if header_idx < 0 or sid_col < 0 or lang_col < 0:
-            print(f"Error: Could not locate header with SID and '{language_name}' in '{xml_path}'.")
+        # Pass 2: if no language header, but SID header exists → use right-most non-empty header as language col
+        if header_idx == -1:
+            for i, row in enumerate(rows):
+                lowered = [_norm(c) for c in row]
+                sid_cols = [j for j, v in enumerate(lowered) if _is_sid_header(v)]
+                if sid_cols:
+                    header_idx = i
+                    sid_col = sid_cols[0]
+                    non_empty = [idx for idx, val in enumerate(row) if _norm(val)]
+                    if non_empty:
+                        lang_col = max(non_empty)
+                    break
+
+        # Pass 3: if SID col still unknown, infer by numeric-ness in next rows
+        if header_idx != -1 and sid_col == -1:
+            lookahead = rows[header_idx+1 : header_idx+21]
+            counts = {}
+            for r in lookahead:
+                for j, val in enumerate(r):
+                    if _looks_like_sid_number(_norm(val)):
+                        counts[j] = counts.get(j, 0) + 1
+            if counts:
+                sid_col = max(counts, key=counts.get)
+
+        if header_idx == -1 or sid_col == -1:
+            print(f"Error: Could not locate headers in '{xml_path}'.")
             return {}
 
-        # Process subsequent rows
+        if lang_col == -1:
+            print(f"Info: Using fallback language column (right-most non-empty) in '{xml_path}'.")
+            non_empty = [idx for idx, val in enumerate(rows[header_idx]) if _norm(val)]
+            lang_col = max(non_empty) if non_empty else (sid_col + 1)
+
+        # Build map
+        loaded = 0
         for r in rows[header_idx+1:]:
-            # Guard for short rows
             if sid_col >= len(r) or lang_col >= len(r):
                 continue
-            sid = r[sid_col].strip()
-            txt = r[lang_col].strip()
-            if sid.isdigit() and txt:
+            sid = _norm(r[sid_col])
+            txt = (r[lang_col] if lang_col < len(r) else "").strip()
+            if _looks_like_sid_number(sid) and txt:
                 sid_to_text[sid] = txt
+                loaded += 1
 
-        print(f"Loaded {len(sid_to_text)} strings from '{xml_path}'.")
+        print(f"Loaded {loaded} strings from '{xml_path}'. (header_row={header_idx}, sid_col={sid_col}, lang_col={lang_col})")
         return sid_to_text
 
     except ET.ParseError as e:
@@ -256,7 +307,8 @@ def load_language_map(xml_path: Optional[str], language_name: str = "English") -
         return {}
 
 # ------------------------------
-
+# Main loops
+# ------------------------------
 def LoopThroughScreens(executable_path, language, font):
     listOfScreens = GetListofScreensAndVariations()
     print(listOfScreens)
@@ -284,7 +336,7 @@ def LoopThroughScreens(executable_path, language, font):
         if missing_in_xml:
             print(f"Note: {len(missing_in_xml)} SID(s) not found in XML for {language_name}: {missing_in_xml}")
 
-        # (Keeping your original run for completeness—doesn't affect Step 2)
+        # (Optional / kept): run the EXE (not required for Step 2)
         result = run_executable(executable_path, language, font, screen_var)
         if result and result.returncode == 0:
             print("Program executed successfully!")
@@ -294,8 +346,7 @@ def LoopThroughScreens(executable_path, language, font):
             print("Failed to execute program")
 
 def LoopThroughLanguages():
-    # Exe name
-    executable_path = "DesktopCP.exe"  # assuming that the exe is in the same directory as this script
+    executable_path = "DesktopCP.exe"  # assuming the exe is in the same directory as this script
     
     for language in Languages_To_Test:  # loop languages and corresponding font
         lang = language[0]
