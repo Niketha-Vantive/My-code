@@ -16,7 +16,7 @@ import sys
 import os
 import csv
 import re
-from typing import Optional
+from typing import Optional, List
 import xml.etree.ElementTree as ET
 
 Languages_To_Test = (
@@ -29,6 +29,7 @@ Languages_To_Test = (
 def run_executable(exe_path, arg1, arg2, arg3):
     """
     Run an executable file with three arguments.
+    (Kept from your original script. Step 2 does not depend on this.)
     """
     if not os.path.exists(exe_path):
         print(f"Error: Executable not found at {exe_path}")
@@ -121,7 +122,7 @@ def GetStringsForScreen_Var(screen, var):
 # ------------------------------
 
 # ------------------------------
-# STEP 2: Load language XML → { SID: text } and map SIDs to texts
+# STEP 2: Load language XML (SpreadsheetML) → { SID: text } and map SIDs to texts
 # ------------------------------
 
 def parse_language_name(language_arg: str) -> str:
@@ -150,53 +151,99 @@ def get_language_xml_path(language_name: str) -> Optional[str]:
     print(f"Warning: Could not find XML for language '{language_name}'. Tried: {candidates}")
     return None
 
-def load_language_map(xml_path: Optional[str]) -> dict:
+# === SpreadsheetML helpers ===
+
+SS_NS = "urn:schemas-microsoft-com:office:spreadsheet"
+SS = f"{{{SS_NS}}}"  # namespace wrapper for ElementTree tag names
+
+def _text(elem: Optional[ET.Element]) -> str:
+    return (elem.text or "").strip() if elem is not None else ""
+
+def _row_to_cells(row: ET.Element) -> List[str]:
     """
-    Parse XML and build { SID: localized_text }.
-    Tries several common schemas:
-      - <String id="12345">Text</String>
-      - <Item id="12345"><Text>Text</Text></Item>
-      - elements with id/SID attributes, or child <SID>, and text in .text or child <Text>/<Value>/etc.
+    Convert a SpreadsheetML Row into a list of cell values (handling ss:Index gaps).
+    Returns a list of strings, each the Data text of the cell (or "" if blank).
+    """
+    cells: List[str] = []
+    col_idx = 0
+    for cell in row.findall(f".//{SS}Cell"):
+        # Handle ss:Index (1-based)
+        idx_attr = cell.get(f"{SS}Index")
+        if idx_attr and idx_attr.isdigit():
+            idx = int(idx_attr) - 1
+            while col_idx < idx:
+                cells.append("")
+                col_idx += 1
+        data = cell.find(f".//{SS}Data")
+        cells.append(_text(data))
+        col_idx += 1
+    return cells
+
+def _read_spreadsheetml_rows(xml_path: str) -> List[List[str]]:
+    """
+    Read all rows (as list of strings) from the first Worksheet/Table.
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    # Find the first Worksheet/Table
+    ws = root.find(f".//{SS}Worksheet")
+    if ws is None:
+        return []
+    table = ws.find(f".//{SS}Table")
+    if table is None:
+        return []
+    rows: List[List[str]] = []
+    for row in table.findall(f".//{SS}Row"):
+        rows.append(_row_to_cells(row))
+    return rows
+
+def load_language_map(xml_path: Optional[str], language_name: str = "English") -> dict:
+    """
+    Parse SpreadsheetML (Excel 2003 XML) and build { SID: localized_text } using
+    the header row to locate the 'SID' column and the '<language_name>' column.
     """
     sid_to_text = {}
     if not xml_path:
         return sid_to_text
 
     try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
+        rows = _read_spreadsheetml_rows(xml_path)
+        if not rows:
+            print(f"Error: No rows found in SpreadsheetML '{xml_path}'.")
+            return {}
 
-        for elem in root.iter():
-            # Try attributes first
-            sid = elem.get('id') or elem.get('ID') or elem.get('Sid') or elem.get('SID')
-            if sid and sid.isdigit():
-                text = (elem.text or '').strip()
-                if not text:
-                    for child_tag in ('Text', 'Value', 'String', 'translation'):
-                        child = elem.find(child_tag)
-                        if child is not None and child.text:
-                            text = child.text.strip()
-                            if text:
-                                break
-                if text:
-                    sid_to_text[sid] = text
+        # Find header row: look for a row containing 'SID' and the language name.
+        header_idx = -1
+        sid_col = -1
+        lang_col = -1
+
+        # Normalize header candidate cells by stripping spaces
+        for i, row in enumerate(rows):
+            lowered = [c.strip() for c in row]
+            # Typical headers might be: ["ID", "Date", "SID", "English", ...]
+            if "sid" in (x.lower() for x in lowered) and language_name.lower() in (x.lower() for x in lowered):
+                header_idx = i
+                # Decide exact columns
+                for j, val in enumerate(lowered):
+                    if val.lower() == "sid":
+                        sid_col = j
+                    if val.lower() == language_name.lower():
+                        lang_col = j
+                break
+
+        if header_idx < 0 or sid_col < 0 or lang_col < 0:
+            print(f"Error: Could not locate header with SID and '{language_name}' in '{xml_path}'.")
+            return {}
+
+        # Process subsequent rows
+        for r in rows[header_idx+1:]:
+            # Guard for short rows
+            if sid_col >= len(r) or lang_col >= len(r):
                 continue
-
-            # If no id attribute, try a child <SID>...</SID> or similar
-            sid_node = elem.find('SID') or elem.find('Id') or elem.find('ID')
-            if sid_node is not None and sid_node.text and sid_node.text.strip().isdigit():
-                sid = sid_node.text.strip()
-                text = ''
-                for child_tag in ('Text', 'Value', 'String', 'translation'):
-                    child = elem.find(child_tag)
-                    if child is not None and child.text:
-                        text = child.text.strip()
-                        if text:
-                            break
-                if not text and elem.text:
-                    text = elem.text.strip()
-                if sid and text:
-                    sid_to_text[sid] = text
+            sid = r[sid_col].strip()
+            txt = r[lang_col].strip()
+            if sid.isdigit() and txt:
+                sid_to_text[sid] = txt
 
         print(f"Loaded {len(sid_to_text)} strings from '{xml_path}'.")
         return sid_to_text
@@ -205,7 +252,7 @@ def load_language_map(xml_path: Optional[str]) -> dict:
         print(f"Error: Failed to parse XML '{xml_path}': {e}")
         return {}
     except Exception as e:
-        print(f"Error: Unexpected while reading XML '{xml_path}': {e}")
+        print(f"Error: Unexpected while reading SpreadsheetML '{xml_path}': {e}")
         return {}
 
 # ------------------------------
@@ -214,10 +261,10 @@ def LoopThroughScreens(executable_path, language, font):
     listOfScreens = GetListofScreensAndVariations()
     print(listOfScreens)
 
-    # Load language map once per language
+    # Load language map once per language (SpreadsheetML-aware)
     language_name = parse_language_name(language)  # '-file=English' -> 'English'
     xml_path = get_language_xml_path(language_name)
-    lang_map = load_language_map(xml_path) if xml_path else {}
+    lang_map = load_language_map(xml_path, language_name) if xml_path else {}
 
     for var in listOfScreens:  # loop screens/variations
         screen = var[0]
